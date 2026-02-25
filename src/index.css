@@ -37,6 +37,12 @@
     background: var(--color-app-border);
     border-radius: 3px;
   }
+
+  textarea:focus,
+  input:focus {
+    border-color: var(--color-app-border-focus) !important;
+    outline: none;
+  }
 }
 
 @keyframes pulse {

@@ -1,7 +1,7 @@
 export const callAPI = async (sys, msgs, maxTok = 4000, useSearch = false) => {
   try {
     const body = {
-      model: "claude-sonnet-4-5-20250929",
+      model: "claude-opus-4-6",
       max_tokens: maxTok,
       system: sys,
       messages: msgs,
