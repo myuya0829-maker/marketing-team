@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Marketing Team AI - データエクスポート</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    min-height: 100vh;
+    background: #0A0E1A;
+    color: #F1F5F9;
+    font-family: 'Noto Sans JP', -apple-system, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .container {
+    max-width: 600px;
+    width: 100%;
+    background: #111827;
+    border: 1px solid #1E293B;
+    border-radius: 12px;
+    padding: 32px;
+  }
+  h1 { font-size: 20px; margin-bottom: 8px; }
+  .desc { font-size: 13px; color: #94A3B8; line-height: 1.7; margin-bottom: 24px; }
+  .steps { margin-bottom: 24px; }
+  .step {
+    display: flex; gap: 12px; padding: 12px 0;
+    border-bottom: 1px solid #1E293B;
+  }
+  .step-num {
+    width: 28px; height: 28px; border-radius: 50%;
+    background: #3B82F622; border: 2px solid #3B82F6;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; color: #3B82F6; flex-shrink: 0;
+  }
+  .step-text { font-size: 13px; color: #94A3B8; line-height: 1.7; }
+  .step-text strong { color: #F1F5F9; }
+  button {
+    background: #3B82F6; color: #fff; border: none;
+    padding: 12px 24px; border-radius: 8px;
+    font-size: 14px; font-weight: 600; cursor: pointer;
+    font-family: inherit; width: 100%;
+    transition: opacity 0.2s;
+  }
+  button:hover { opacity: 0.9; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .result {
+    margin-top: 16px; padding: 16px;
+    border-radius: 8px; font-size: 13px; line-height: 1.7;
+  }
+  .result.success { background: #10B98122; border: 1px solid #10B98144; color: #10B981; }
+  .result.error { background: #EF444422; border: 1px solid #EF444444; color: #EF4444; }
+  .result.info { background: #3B82F622; border: 1px solid #3B82F644; color: #94A3B8; }
+  .stats { margin-top: 12px; font-size: 12px; color: #64748B; }
+  .stats div { padding: 2px 0; }
+  .stats span { color: #F1F5F9; font-weight: 600; }
+  code {
+    background: #0D1220; padding: 2px 6px; border-radius: 4px;
+    font-size: 12px; color: #22D3EE;
+  }
+  .warning {
+    margin-top: 16px; padding: 12px;
+    background: #F59E0B11; border: 1px solid #F59E0B33;
+    border-radius: 8px; font-size: 12px; color: #F59E0B; line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📦 データエクスポート</h1>
+  <p class="desc">
+    旧アプリ（Claude Artifact）の <code>window.storage</code> から全データを読み出し、
+    JSONファイルとしてダウンロードします。
+  </p>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-text">
+        <strong>旧アプリのArtifact内</strong>で、ブラウザのDevTools（F12）を開く
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-text">
+        Consoleタブに <strong>下記スクリプト</strong> を貼り付けて実行
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-text">
+        JSONファイルがダウンロードされるので、<strong>新アプリの設定画面</strong>でインポート
+      </div>
+    </div>
+  </div>
+
+  <div class="warning">
+    ⚠️ このHTMLファイルはArtifact外なので <code>window.storage</code> にアクセスできません。<br>
+    下の「スクリプトをコピー」ボタンでコピーし、<strong>旧アプリのArtifact画面のDevTools Console</strong>に貼り付けてください。
+  </div>
+
+  <button id="copyBtn" style="margin-top: 16px;">📋 エクスポートスクリプトをコピー</button>
+
+  <div id="result"></div>
+</div>
+
+<script>
+// ====================================
+// エクスポートスクリプト本体
+// 旧アプリのDevTools Consoleに貼り付けて実行
+// ====================================
+const EXPORT_SCRIPT = `
+(async function() {
+  // 読み取り対象キー（バージョン違いも含めて全て試す）
+  const KEY_MAP = {
+    agents: [
+      "mkt-team:agents-v3",
+      "mkt-team:agents-v2",
+      "mkt-team:agents",
+    ],
+    knowledge: [
+      "mkt-team:knowledge-v4",
+      "mkt-team:knowledge-v3",
+      "mkt-team:knowledge",
+      "ai-emp:knowledge-v1",
+    ],
+    feedbacks: [
+      "mkt-team:fb-v1",
+      "mkt-team:feedbacks-v1",
+      "mkt-team:feedbacks",
+      "ai-emp:feedbacks-v2",
+    ],
+    tasks: [
+      "mkt-team:tasks-v1",
+      "mkt-team:tasks",
+    ],
+    reports: [
+      "mkt-team:reports",
+    ],
+    clients: [
+      "mkt-team:clients",
+    ],
+    projects: [
+      "mkt-team:projects",
+    ],
+    templates: [
+      "mkt-team:templates",
+    ],
+    recurring: [
+      "mkt-team:recurring",
+    ],
+    archivedTasks: [
+      "mkt-team:archived-tasks",
+    ],
+    history: [
+      "mkt-team:history-v1",
+      "mkt-team:history",
+    ],
+  };
+
+  async function tryRead(key) {
+    try {
+      var r = await window.storage.get(key);
+      if (r && r.value) return JSON.parse(r.value);
+    } catch(e) {}
+    return null;
+  }
+
+  // 各カテゴリで最初にデータが見つかったキーを採用
+  async function readFirst(keys) {
+    for (var i = 0; i < keys.length; i++) {
+      var data = await tryRead(keys[i]);
+      if (data !== null && data !== undefined) {
+        // 配列の場合は中身があるものを優先
+        if (Array.isArray(data) && data.length > 0) return { data: data, key: keys[i] };
+        // オブジェクトの場合はキーがあるものを優先
+        if (typeof data === "object" && !Array.isArray(data) && Object.keys(data).length > 0) return { data: data, key: keys[i] };
+        // 空でも一応記録（後続で見つからなければこれを使う）
+        if (!firstEmpty) var firstEmpty = { data: data, key: keys[i] };
+      }
+    }
+    return firstEmpty || null;
+  }
+
+  var exportData = { version: "1.0", exportedAt: new Date().toISOString(), source: "claude-artifact", data: {} };
+  var stats = {};
+
+  for (var category in KEY_MAP) {
+    var result = await readFirst(KEY_MAP[category]);
+    if (result) {
+      exportData.data[category] = result.data;
+      var count = Array.isArray(result.data)
+        ? result.data.length
+        : typeof result.data === "object"
+          ? Object.keys(result.data).length
+          : 1;
+      stats[category] = { count: count, sourceKey: result.key };
+    }
+  }
+
+  // ダウンロード
+  var json = JSON.stringify(exportData, null, 2);
+  var blob = new Blob([json], { type: "application/json" });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = "marketing-team-export-" + new Date().toISOString().slice(0,10) + ".json";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  // 結果表示
+  console.log("=== Marketing Team AI Export ===");
+  console.log("Exported at:", exportData.exportedAt);
+  for (var cat in stats) {
+    console.log(cat + ": " + stats[cat].count + " items (from " + stats[cat].sourceKey + ")");
+  }
+  console.log("File size:", (json.length / 1024).toFixed(1) + " KB");
+  console.log("================================");
+  console.log("✅ エクスポート完了！ダウンロードされたJSONファイルを新アプリでインポートしてください。");
+})();
+`.trim();
+
+document.getElementById("copyBtn").addEventListener("click", async function() {
+  try {
+    await navigator.clipboard.writeText(EXPORT_SCRIPT);
+    var resultEl = document.getElementById("result");
+    resultEl.className = "result success";
+    resultEl.innerHTML = "✅ コピーしました！<br><br>旧アプリの Artifact 画面で DevTools Console を開き、貼り付けて実行してください。";
+    this.textContent = "✅ コピー済み";
+    setTimeout(function() {
+      document.getElementById("copyBtn").textContent = "📋 エクスポートスクリプトをコピー";
+    }, 3000);
+  } catch(e) {
+    var resultEl = document.getElementById("result");
+    resultEl.className = "result error";
+    resultEl.textContent = "コピーに失敗しました: " + e.message;
+  }
+});
+</script>
+</body>
+</html>

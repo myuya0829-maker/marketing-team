@@ -122,6 +122,8 @@ export default function MarketingTeamAI() {
             knowledge={knowledge}
             feedbacks={feedbacks}
             onSaveRules={saveAgentRules}
+            onToast={(m) => setToast(m)}
+            onImportComplete={() => window.location.reload()}
           />
         )}
       </div>
