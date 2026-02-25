@@ -1,16 +1,36 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { T } from "../../lib/constants";
 import { todayKey, dateLabel } from "../../lib/dates";
 import { fmtSec } from "../../lib/format";
+import {
+  fetchTasksByDate,
+  insertTask as insertTaskDB,
+  updateTask as updateTaskDB,
+  deleteTask as deleteTaskDB,
+} from "../../hooks/useStorage";
 import Card from "../ui/Card";
 import Btn from "../ui/Btn";
 
-export default function TaskManagementView({ tasks, onSave }) {
+export default function TaskManagementView() {
   const [date, setDate] = useState(todayKey());
+  const [dayTasks, setDayTasks] = useState([]);
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
   const [newEst, setNewEst] = useState(30);
   const [, setTicker] = useState(0);
+  const [loadingTasks, setLoadingTasks] = useState(true);
+
+  // Fetch tasks for current date
+  const loadTasks = useCallback(async () => {
+    setLoadingTasks(true);
+    const tasks = await fetchTasksByDate(date);
+    setDayTasks(tasks);
+    setLoadingTasks(false);
+  }, [date]);
+
+  useEffect(() => {
+    loadTasks();
+  }, [loadTasks]);
 
   // Tick every second for live stopwatch
   useEffect(() => {
@@ -18,7 +38,6 @@ export default function TaskManagementView({ tasks, onSave }) {
     return () => clearInterval(t);
   }, []);
 
-  const dayTasks = tasks[date] || [];
   const completed = dayTasks.filter((t) => t.done).length;
   const total = dayTasks.length;
 
@@ -31,76 +50,77 @@ export default function TaskManagementView({ tasks, onSave }) {
   const totalEstimate = dayTasks.reduce((s, t) => s + t.estimateSec, 0);
   const totalElapsed = dayTasks.reduce((s, t) => s + getElapsed(t), 0);
 
-  const addTask = () => {
+  const addTask = async () => {
     if (!newName.trim()) return;
     const task = {
-      id: String(Date.now()),
       name: newName.trim(),
       estimateSec: newEst * 60,
       elapsedSec: 0,
       running: false,
       runStartedAt: null,
       done: false,
-      createdAt: Date.now(),
     };
-    const updated = { ...tasks, [date]: [...(tasks[date] || []), task] };
-    onSave(updated);
+    await insertTaskDB(date, task);
+    await loadTasks();
     setNewName("");
     setNewEst(30);
     setAdding(false);
   };
 
-  const startStop = (id) => {
-    const updated = {
-      ...tasks,
-      [date]: (tasks[date] || []).map((t) => {
-        if (t.id === id) {
-          if (t.running) {
-            const extra = t.runStartedAt ? Math.floor((Date.now() - t.runStartedAt) / 1000) : 0;
-            return { ...t, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null };
-          } else {
-            return { ...t, running: true, runStartedAt: Date.now() };
-          }
-        }
-        // Stop other running tasks
-        if (t.running && !t.done) {
+  const startStop = async (id) => {
+    // Update in-memory immediately for responsiveness
+    const updated = dayTasks.map((t) => {
+      if (t.id === id) {
+        if (t.running) {
           const extra = t.runStartedAt ? Math.floor((Date.now() - t.runStartedAt) / 1000) : 0;
-          return { ...t, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null };
+          const u = { ...t, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null };
+          updateTaskDB(id, u);
+          return u;
+        } else {
+          const u = { ...t, running: true, runStartedAt: Date.now() };
+          updateTaskDB(id, u);
+          return u;
         }
-        return t;
-      }),
-    };
-    onSave(updated);
+      }
+      // Stop other running tasks
+      if (t.running && !t.done) {
+        const extra = t.runStartedAt ? Math.floor((Date.now() - t.runStartedAt) / 1000) : 0;
+        const u = { ...t, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null };
+        updateTaskDB(t.id, u);
+        return u;
+      }
+      return t;
+    });
+    setDayTasks(updated);
   };
 
-  const markDone = (id) => {
-    const updated = {
-      ...tasks,
-      [date]: (tasks[date] || []).map((t) => {
-        if (t.id !== id) return t;
-        if (!t.done) {
-          const extra = t.running && t.runStartedAt ? Math.floor((Date.now() - t.runStartedAt) / 1000) : 0;
-          return { ...t, done: true, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null };
-        }
-        return { ...t, done: false };
-      }),
-    };
-    onSave(updated);
+  const markDone = async (id) => {
+    const updated = dayTasks.map((t) => {
+      if (t.id !== id) return t;
+      if (!t.done) {
+        const extra = t.running && t.runStartedAt ? Math.floor((Date.now() - t.runStartedAt) / 1000) : 0;
+        const u = { ...t, done: true, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null };
+        updateTaskDB(id, u);
+        return u;
+      }
+      const u = { ...t, done: false };
+      updateTaskDB(id, u);
+      return u;
+    });
+    setDayTasks(updated);
   };
 
-  const deleteTask = (id) => {
-    const updated = { ...tasks, [date]: (tasks[date] || []).filter((t) => t.id !== id) };
-    onSave(updated);
+  const handleDeleteTask = async (id) => {
+    setDayTasks((prev) => prev.filter((t) => t.id !== id));
+    await deleteTaskDB(id);
   };
 
-  const resetTimer = (id) => {
-    const updated = {
-      ...tasks,
-      [date]: (tasks[date] || []).map((t) =>
-        t.id === id ? { ...t, elapsedSec: 0, running: false, runStartedAt: null, done: false } : t
-      ),
-    };
-    onSave(updated);
+  const resetTimer = async (id) => {
+    const updates = { elapsedSec: 0, running: false, runStartedAt: null, done: false };
+    setDayTasks((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, ...updates } : t))
+    );
+    await updateTaskDB(id, updates);
   };
 
   const prevDay = () => {
@@ -156,6 +176,11 @@ export default function TaskManagementView({ tasks, onSave }) {
           </div>
         </Card>
       </div>
+
+      {/* Loading */}
+      {loadingTasks && (
+        <div style={{ textAlign: "center", color: T.textMuted, fontSize: 13, padding: 16 }}>読み込み中...</div>
+      )}
 
       {/* Task List */}
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -233,7 +258,7 @@ export default function TaskManagementView({ tasks, onSave }) {
                 )}
 
                 {/* Delete */}
-                <button onClick={() => deleteTask(task.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 12, opacity: 0.4, flexShrink: 0 }}>
+                <button onClick={() => handleDeleteTask(task.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 12, opacity: 0.4, flexShrink: 0 }}>
                   🗑
                 </button>
               </div>

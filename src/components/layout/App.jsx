@@ -111,7 +111,7 @@ export default function MarketingTeamAI() {
             onToast={(m) => setToast(m)}
           />
         )}
-        {view === "task" && <TaskManagementView tasks={tasks} onSave={saveTasks} />}
+        {view === "task" && <TaskManagementView />}
         {view === "learning" && (
           <KnowledgeView knowledge={knowledge} onAdd={addKnowledge} onDelete={deleteKnowledge} agents={agents} />
         )}

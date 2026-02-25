@@ -1,6 +1,14 @@
 import { createContext, useState, useEffect, useContext, useCallback } from "react";
-import { SK, OLD_KNOWLEDGE_KEYS, OLD_FEEDBACK_KEYS, AGENTS } from "../lib/constants";
-import { storeGet, storeSet, migrateGet } from "../hooks/useStorage";
+import { AGENTS } from "../lib/constants";
+import {
+  fetchAgentRules,
+  upsertAgentRule,
+  fetchKnowledge,
+  insertKnowledge,
+  deleteKnowledgeById,
+  fetchFeedbacks,
+  insertFeedback,
+} from "../hooks/useStorage";
 
 const AppContext = createContext(null);
 
@@ -8,63 +16,71 @@ export function AppProvider({ children }) {
   const [agentRules, setAgentRules] = useState({});
   const [knowledge, setKnowledge] = useState([]);
   const [feedbacks, setFeedbacks] = useState([]);
-  const [tasks, setTasks] = useState({});
+  const [tasks, setTasks] = useState({}); // { [dateKey]: [...tasks] } - kept in memory, synced per-date
   const [toast, setToast] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     (async () => {
-      const r1 = await storeGet(SK.agents);
-      if (r1) setAgentRules(r1);
-
-      // Knowledge - migrate from any old key
-      const r2 = await migrateGet(SK.knowledge, OLD_KNOWLEDGE_KEYS, (oldKn) =>
-        oldKn.map((k) => ({ ...k, assignedAgents: k.assignedAgents || ["all"] }))
-      );
-      if (r2) setKnowledge(r2);
-
-      // Feedbacks - migrate
-      const r3 = await migrateGet(SK.feedbacks, OLD_FEEDBACK_KEYS);
-      if (r3) setFeedbacks(r3);
-
-      // Tasks
-      const r4 = await storeGet(SK.tasks);
-      if (r4) setTasks(r4);
-
+      try {
+        const [rules, kn, fb] = await Promise.all([
+          fetchAgentRules(),
+          fetchKnowledge(),
+          fetchFeedbacks(),
+        ]);
+        setAgentRules(rules);
+        setKnowledge(kn);
+        setFeedbacks(fb);
+      } catch (e) {
+        console.error("Initial load error:", e);
+      }
       setLoading(false);
     })();
   }, []);
 
-  const saveAgentRules = useCallback(async (id, rules) => {
-    const n = { ...agentRules, [id]: rules };
-    setAgentRules(n);
-    await storeSet(SK.agents, n);
-    setToast("✅ ルール保存");
-  }, [agentRules]);
+  const saveAgentRules = useCallback(
+    async (id, rules) => {
+      const n = { ...agentRules, [id]: rules };
+      setAgentRules(n);
+      await upsertAgentRule(id, rules);
+      setToast("✅ ルール保存");
+    },
+    [agentRules]
+  );
 
-  const addKnowledge = useCallback(async (item) => {
-    const n = [item, ...knowledge];
-    setKnowledge(n);
-    await storeSet(SK.knowledge, n);
-    setToast("✅ ナレッジ追加");
-  }, [knowledge]);
+  const addKnowledge = useCallback(
+    async (item) => {
+      await insertKnowledge(item);
+      // Re-fetch to get the server-generated id
+      const fresh = await fetchKnowledge();
+      setKnowledge(fresh);
+      setToast("✅ ナレッジ追加");
+    },
+    []
+  );
 
-  const deleteKnowledge = useCallback(async (id) => {
-    const n = knowledge.filter((k) => k.id !== id);
-    setKnowledge(n);
-    await storeSet(SK.knowledge, n);
-    setToast("🗑 削除");
-  }, [knowledge]);
+  const deleteKnowledgeItem = useCallback(
+    async (id) => {
+      await deleteKnowledgeById(id);
+      setKnowledge((prev) => prev.filter((k) => k.id !== id));
+      setToast("🗑 削除");
+    },
+    []
+  );
 
-  const addFeedback = useCallback(async (fb) => {
-    const n = [fb, ...feedbacks];
-    setFeedbacks(n);
-    await storeSet(SK.feedbacks, n);
-  }, [feedbacks]);
+  const addFeedback = useCallback(
+    async (fb) => {
+      await insertFeedback(fb);
+      const fresh = await fetchFeedbacks();
+      setFeedbacks(fresh);
+    },
+    []
+  );
 
+  // Tasks are still managed with in-memory { [dateKey]: [...] } structure
+  // But individual CRUD ops go through Supabase (handled by TaskManagementView)
   const saveTasks = useCallback(async (t) => {
     setTasks(t);
-    await storeSet(SK.tasks, t);
   }, []);
 
   return (
@@ -80,9 +96,10 @@ export function AppProvider({ children }) {
         setToast,
         saveAgentRules,
         addKnowledge,
-        deleteKnowledge,
+        deleteKnowledge: deleteKnowledgeItem,
         addFeedback,
         saveTasks,
+        setTasks,
       }}
     >
       {children}
