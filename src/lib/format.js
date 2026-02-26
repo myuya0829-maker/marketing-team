@@ -38,3 +38,16 @@ export const parseJSON = (t) => {
     return null;
   }
 };
+
+/** Strip HTML tags and normalize whitespace */
+export const stripHtml = (html) => {
+  let txt = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+  txt = txt.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "");
+  txt = txt.replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, "");
+  txt = txt.replace(/<header[^>]*>[\s\S]*?<\/header>/gi, "");
+  txt = txt.replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, "");
+  txt = txt.replace(/<[^>]+>/g, " ");
+  txt = txt.replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+  txt = txt.replace(/\s+/g, " ").trim();
+  return txt;
+};
