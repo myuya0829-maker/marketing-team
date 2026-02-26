@@ -311,6 +311,9 @@ export const fetchProjects = async () => {
     tasks: row.tasks || [],
     memos: row.memos || [],
     articleEnabled: row.article_enabled || false,
+    spreadsheetUrl: row.spreadsheet_url || "",
+    siteUrl: row.site_url || "",
+    sheetName: row.sheet_name || "シート1",
     createdAt: row.created_at,
   }));
 };
@@ -324,6 +327,9 @@ export const upsertProject = async (project) => {
     tasks: project.tasks || [],
     memos: project.memos || [],
     article_enabled: project.articleEnabled || false,
+    spreadsheet_url: project.spreadsheetUrl || null,
+    site_url: project.siteUrl || null,
+    sheet_name: project.sheetName || "シート1",
   };
   if (project.id && !String(project.id).startsWith("proj-seed-")) {
     const { error } = await supabase.from("projects").update(payload).eq("id", project.id);
@@ -569,4 +575,73 @@ export const upsertSettings = async (settings) => {
       { onConflict: "user_id" }
     );
   if (error) console.error("upsertSettings:", error);
+};
+
+// ========================
+// Article Check Results
+// ========================
+export const fetchCheckResults = async (projectName, month) => {
+  let query = supabase
+    .from("article_check_results")
+    .select("*")
+    .eq("user_id", USER_ID);
+  if (projectName) query = query.eq("project_name", projectName);
+  if (month) query = query.eq("month", month);
+  query = query.order("checked_at", { ascending: false });
+  const { data, error } = await query;
+  if (error) {
+    console.error("fetchCheckResults:", error);
+    return [];
+  }
+  return data.map((row) => ({
+    id: row.id,
+    projectName: row.project_name,
+    keyword: row.keyword,
+    title: row.title,
+    docUrl: row.doc_url,
+    month: row.month,
+    articleType: row.article_type,
+    factcheckCritical: row.factcheck_critical,
+    factcheckWarning: row.factcheck_warning,
+    factcheckInfo: row.factcheck_info,
+    factcheckDetail: row.factcheck_detail,
+    finalcheckTypos: row.finalcheck_typos,
+    finalcheckVerdict: row.finalcheck_verdict,
+    finalcheckDetail: row.finalcheck_detail,
+    commentsInserted: row.comments_inserted,
+    status: row.status,
+    errorMessage: row.error_message,
+    checkedAt: row.checked_at,
+  }));
+};
+
+export const fetchCheckResultById = async (id) => {
+  const { data, error } = await supabase
+    .from("article_check_results")
+    .select("*")
+    .eq("id", id)
+    .single();
+  if (error) {
+    console.error("fetchCheckResultById:", error);
+    return null;
+  }
+  return {
+    id: data.id,
+    projectName: data.project_name,
+    keyword: data.keyword,
+    title: data.title,
+    docUrl: data.doc_url,
+    month: data.month,
+    factcheckCritical: data.factcheck_critical,
+    factcheckWarning: data.factcheck_warning,
+    factcheckInfo: data.factcheck_info,
+    factcheckDetail: data.factcheck_detail,
+    finalcheckTypos: data.finalcheck_typos,
+    finalcheckVerdict: data.finalcheck_verdict,
+    finalcheckDetail: data.finalcheck_detail,
+    commentsInserted: data.comments_inserted,
+    status: data.status,
+    errorMessage: data.error_message,
+    checkedAt: data.checked_at,
+  };
 };

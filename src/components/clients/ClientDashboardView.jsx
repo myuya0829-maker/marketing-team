@@ -342,6 +342,18 @@ export default function ClientDashboardView() {
           {sel.siteUrl && <a href={sel.siteUrl.startsWith("http") ? sel.siteUrl : "https://" + sel.siteUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: 9, color: T.accent, textDecoration: "none", flexShrink: 0 }}>↗ 開く</a>}
         </div>
 
+        {/* Spreadsheet URL (for SEO article checker) */}
+        {(svcs.includes("SEO") || sel.articleEnabled) && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 0", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 10, color: T.textDim, flexShrink: 0 }}>📊 記事管理シート:</span>
+            <input value={sel.spreadsheetUrl || ""} onChange={(e) => updateProject(sel.id, { spreadsheetUrl: e.target.value })} placeholder="https://docs.google.com/spreadsheets/d/..."
+              style={{ flex: 1, minWidth: 180, padding: "3px 8px", background: T.bgInput, border: `1px solid ${sel.spreadsheetUrl ? T.accent + "44" : T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 10, fontFamily: T.font, outline: "none" }} />
+            <input value={sel.sheetName || "シート1"} onChange={(e) => updateProject(sel.id, { sheetName: e.target.value })} placeholder="シート名"
+              style={{ width: 80, padding: "3px 8px", background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 10, fontFamily: T.font, outline: "none", textAlign: "center" }} />
+            {sel.spreadsheetUrl && <a href={sel.spreadsheetUrl.startsWith("http") ? sel.spreadsheetUrl : "https://" + sel.spreadsheetUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: 9, color: T.accent, textDecoration: "none", flexShrink: 0 }}>↗ 開く</a>}
+          </div>
+        )}
+
         {/* Compact stats */}
         <div style={{ display: "flex", gap: 12, padding: "6px 0", fontSize: 11, color: T.textMuted, flexWrap: "wrap" }}>
           {openTasks.length > 0 && <span style={{ color: cc.color, fontWeight: 600 }}>📌 未完了 {openTasks.length}</span>}

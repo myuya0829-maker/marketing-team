@@ -4,9 +4,9 @@
  * @param {Array} msgs - Messages array
  * @param {number} maxTok - Max tokens (default 4000)
  * @param {boolean} useSearch - Enable web search tool
- * @param {string} model - Model to use (default claude-sonnet-4-20250514)
+ * @param {string} model - Model to use (default claude-opus-4-0-20250514)
  */
-export const callAPI = async (sys, msgs, maxTok = 4000, useSearch = false, model = "claude-sonnet-4-20250514") => {
+export const callAPI = async (sys, msgs, maxTok = 4000, useSearch = false, model = "claude-opus-4-0-20250514") => {
   try {
     const body = {
       model,
@@ -19,7 +19,7 @@ export const callAPI = async (sys, msgs, maxTok = 4000, useSearch = false, model
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
+    const timeoutId = setTimeout(() => controller.abort(), 180000);
 
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -39,7 +39,7 @@ export const callAPI = async (sys, msgs, maxTok = 4000, useSearch = false, model
         .join("\n");
     return "応答なし";
   } catch (e) {
-    return "エラー: " + (e.name === "AbortError" ? "タイムアウト（120秒）" : e.message);
+    return "エラー: " + (e.name === "AbortError" ? "タイムアウト（180秒）" : e.message);
   }
 };
 

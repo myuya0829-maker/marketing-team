@@ -9,21 +9,24 @@ import {
   insertTask as insertTaskDB,
   updateTask as updateTaskDB,
   deleteTask as deleteTaskDB,
+  fetchCheckResults,
 } from "../../hooks/useStorage";
 import { useApp } from "../../contexts/AppContext";
 import Card from "../ui/Card";
 import Btn from "../ui/Btn";
 
-// Article pipeline statuses
+// Article pipeline statuses (legacy-compatible 7 stages)
+// self: true = 自分待ち（赤バッジ）, false = 業者待ち（青バッジ）
 const ART_STEPS = [
-  { id: "not_started", label: "未着手", color: T.textMuted },
-  { id: "kw_done", label: "KW選定済", color: "#60A5FA" },
-  { id: "writing", label: "執筆中", color: T.warning },
-  { id: "review", label: "確認待ち", color: T.purple },
-  { id: "fix", label: "修正中", color: "#F472B6" },
-  { id: "submit", label: "提出済", color: T.success },
-  { id: "published", label: "公開済", color: T.cyan },
+  { id: "kw_select",        label: "KW選定",      self: false, color: T.accent },
+  { id: "kw_review",        label: "KW確認",      self: true,  color: T.error },
+  { id: "structure",        label: "構成作成",    self: false, color: T.accent },
+  { id: "structure_review", label: "構成確認",    self: true,  color: T.error },
+  { id: "writing",          label: "執筆中",      self: false, color: T.accent },
+  { id: "writing_review",   label: "執筆確認",    self: true,  color: T.error },
+  { id: "submit",           label: "提出",        self: false, color: T.success },
 ];
+const ART_STEP_IDS = ART_STEPS.map((s) => s.id);
 
 const BALL_HOLDERS = [
   { id: "self", label: "自分", color: T.accent },
@@ -72,6 +75,9 @@ export default function TaskManagementView() {
   // Article state
   const [artMonthFilter, setArtMonthFilter] = useState(curMonth());
   const [expandedArt, setExpandedArt] = useState(null);
+  const [checkResults, setCheckResults] = useState([]);
+  const [checkCmd, setCheckCmd] = useState(null); // {project, month} for command modal
+  const [expandedResult, setExpandedResult] = useState(null);
 
   // Editing states
   const [editingTask, setEditingTask] = useState(null);
@@ -107,6 +113,13 @@ export default function TaskManagementView() {
 
   useEffect(() => { loadDayTasks(); }, [loadDayTasks]);
   useEffect(() => { loadSpecialTasks(); }, [loadSpecialTasks]);
+
+  // Load check results when article month changes
+  useEffect(() => {
+    if (tmTab === "articles") {
+      fetchCheckResults(null, artMonthFilter).then(setCheckResults).catch(() => setCheckResults([]));
+    }
+  }, [tmTab, artMonthFilter]);
 
   // Tick every second for live stopwatch
   useEffect(() => {
@@ -316,7 +329,7 @@ export default function TaskManagementView() {
   const addArticle = async (projectName) => {
     await insertTaskDB(todayKey(), {
       name: projectName, project: projectName, month: artMonthFilter,
-      status: "not_started", taskType: "article",
+      status: "kw_select", taskType: "article",
     });
     await loadSpecialTasks();
   };
@@ -335,9 +348,9 @@ export default function TaskManagementView() {
   const revertArticle = async (id) => {
     const art = articles.find((a) => a.id === id);
     if (!art) return;
-    const idx = ART_STEPS.findIndex((s) => s.id === art.status);
+    const idx = ART_STEP_IDS.indexOf(art.status);
     if (idx > 0) {
-      const prev = ART_STEPS[idx - 1].id;
+      const prev = ART_STEP_IDS[idx - 1];
       setArticles((p) => p.map((a) => (a.id === id ? { ...a, status: prev } : a)));
       await updateTaskDB(id, { status: prev });
     }
@@ -346,6 +359,23 @@ export default function TaskManagementView() {
   const deleteArticle = async (id) => {
     setArticles((prev) => prev.filter((a) => a.id !== id));
     await deleteTaskDB(id);
+  };
+
+  // ── Check Results helpers ──
+  const getCheckResult = (projectName) => {
+    return checkResults.find((r) => r.projectName === projectName && r.status === "done");
+  };
+
+  const copyCheckCommand = (projectName) => {
+    const cmd = `cd ~/Downloads/seo-agent-project/seo-checker && python agent.py --month ${artMonthFilter} --project "${projectName}"`;
+    navigator.clipboard.writeText(cmd).then(() => {
+      setToast(`📋 コマンドをコピーしました`);
+    });
+    setCheckCmd({ project: projectName, month: artMonthFilter, cmd });
+  };
+
+  const reloadCheckResults = () => {
+    fetchCheckResults(null, artMonthFilter).then(setCheckResults).catch(() => setCheckResults([]));
   };
 
   // ── Navigation ──
@@ -375,7 +405,7 @@ export default function TaskManagementView() {
             { id: "list", label: "📋 一覧" },
             { id: "inprog", label: "🔄 進行中", badge: inprogress.filter((t) => !t.done).length },
             { id: "deleg", label: "👥 依頼", badge: pendingDelegCount },
-            { id: "articles", label: "📝 記事" },
+            { id: "articles", label: "📝 コンテンツSEO", badge: articles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length },
           ].map((t) => (
             <button key={t.id} onClick={() => setTmTab(t.id)} style={{
               padding: "6px 10px", fontSize: 11, fontWeight: tmTab === t.id ? 600 : 400,
@@ -705,9 +735,32 @@ export default function TaskManagementView() {
         </div>
       )}
 
-      {/* ═══ ARTICLES TAB ═══ */}
-      {tmTab === "articles" && (
+      {/* ═══ ARTICLES TAB (コンテンツSEO進捗管理) ═══ */}
+      {tmTab === "articles" && (() => {
+        // Count stats
+        const selfCount = filteredArticles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length;
+        const doneCount = filteredArticles.filter((a) => a.status === "done").length;
+        const activeArticles = filteredArticles.filter((a) => a.status !== "done");
+        // Sort: self-waiting first, then by progress (furthest along first)
+        const sorted = [...activeArticles].sort((a, b) => {
+          const idxA = ART_STEP_IDS.indexOf(a.status);
+          const idxB = ART_STEP_IDS.indexOf(b.status);
+          const selfA = (idxA >= 0 && ART_STEPS[idxA].self) ? 1 : 0;
+          const selfB = (idxB >= 0 && ART_STEPS[idxB].self) ? 1 : 0;
+          if (selfA !== selfB) return selfB - selfA;
+          if (idxA !== idxB) return idxB - idxA;
+          return 0;
+        });
+        return (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {/* Header */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: T.text }}>📝 コンテンツSEO進捗管理</div>
+            <span style={{ fontSize: 11, color: T.textMuted }}>
+              全数 {filteredArticles.length} / 進行中 {activeArticles.length} / 完了 {doneCount}
+            </span>
+          </div>
+
           {/* Month navigation */}
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <Btn variant="ghost" onClick={() => setArtMonthFilter(prevMonthKey(artMonthFilter))} style={{ fontSize: 14, padding: "4px 8px" }}>←</Btn>
@@ -715,47 +768,110 @@ export default function TaskManagementView() {
             <Btn variant="ghost" onClick={() => setArtMonthFilter(nextMonthKey(artMonthFilter))} style={{ fontSize: 14, padding: "4px 8px" }}>→</Btn>
             {artMonthFilter !== curMonth() && <Btn variant="secondary" onClick={() => setArtMonthFilter(curMonth())} style={{ fontSize: 10 }}>今月</Btn>}
             <div style={{ flex: 1 }} />
-            <span style={{ fontSize: 11, color: T.textMuted }}>{filteredArticles.length}件</span>
+            {selfCount > 0 && <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: T.error + "18", color: T.error, fontWeight: 600 }}>🔴 自分待ち {selfCount}</span>}
           </div>
 
-          {/* Pipeline summary */}
-          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+          {/* Pipeline summary bar */}
+          <div style={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
             {ART_STEPS.map((step) => {
               const count = filteredArticles.filter((a) => a.status === step.id).length;
               return (
-                <span key={step.id} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 99, background: count > 0 ? step.color + "22" : T.bgCard, color: count > 0 ? step.color : T.textMuted, border: `1px solid ${count > 0 ? step.color + "44" : T.border}` }}>
-                  {step.label}: {count}
-                </span>
+                <div key={step.id} style={{ flex: 1, padding: "6px 2px", background: count > 0 ? (step.self ? T.error + "18" : T.accent + "10") : T.bgCard, textAlign: "center", borderRadius: 4, minWidth: 50 }}>
+                  <div style={{ fontSize: 8, color: count > 0 ? (step.self ? T.error : T.accent) : T.textMuted, fontWeight: 600 }}>{step.label}</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: count > 0 ? (step.self ? T.error : T.accent) : T.textMuted }}>{count}</div>
+                </div>
               );
             })}
+            <div style={{ flex: 1, padding: "6px 2px", background: doneCount > 0 ? T.success + "18" : T.bgCard, textAlign: "center", borderRadius: 4, minWidth: 50 }}>
+              <div style={{ fontSize: 8, color: doneCount > 0 ? T.success : T.textMuted, fontWeight: 600 }}>完了</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: doneCount > 0 ? T.success : T.textMuted }}>{doneCount}</div>
+            </div>
           </div>
 
-          {/* Article list */}
-          {filteredArticles.map((art) => {
-            const step = ART_STEPS.find((s) => s.id === art.status) || ART_STEPS[0];
+          {/* Article list (sorted: self-waiting first) */}
+          {sorted.map((art) => {
+            const stepIdx = ART_STEP_IDS.indexOf(art.status);
+            const curStep = stepIdx >= 0 ? ART_STEPS[stepIdx] : null;
+            const isSelf = curStep && curStep.self;
+            const badgeColor = isSelf ? T.error : (curStep ? T.accent : T.textMuted);
             const expanded = expandedArt === art.id;
+            const cr = getCheckResult(art.project || art.name);
+            const isWritingReview = art.status === "writing_review";
             return (
-              <Card key={art.id} style={{ border: `1px solid ${step.color}33` }}>
+              <Card key={art.id} style={{ border: `1px solid ${isSelf ? T.error + "44" : badgeColor + "22"}`, background: isSelf ? T.error + "06" : undefined }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <button onClick={() => revertArticle(art.id)} disabled={art.status === "not_started"} style={{ fontSize: 12, background: "none", border: "none", cursor: "pointer", color: T.textMuted, opacity: art.status === "not_started" ? 0.2 : 0.6 }}>◀</button>
-                  <span style={{ fontSize: 9, padding: "2px 8px", borderRadius: 99, background: step.color + "22", color: step.color, fontWeight: 600 }}>{step.label}</span>
-                  <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>{art.name || art.project}</span>
+                  <button onClick={() => revertArticle(art.id)} disabled={stepIdx <= 0} style={{ fontSize: 12, background: "none", border: "none", cursor: "pointer", color: T.textMuted, opacity: stepIdx <= 0 ? 0.2 : 0.6, fontFamily: T.font }}>◀</button>
+                  {/* Status badge: red for self, blue for vendor */}
+                  <span style={{ fontSize: 10, padding: "3px 10px", borderRadius: 6, background: isSelf ? T.error + "15" : T.accent + "15", color: isSelf ? T.error : T.accent, fontWeight: 600, whiteSpace: "nowrap" }}>
+                    {isSelf ? "🔴" : "🔵"} {curStep ? curStep.label : "未着手"}
+                  </span>
+                  {/* Project name */}
+                  <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>{art.project || art.name}</span>
+                  {/* Check result badge */}
+                  {cr && (
+                    <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 4, background: cr.finalcheckVerdict === "GO" ? T.success + "15" : T.error + "15", color: cr.finalcheckVerdict === "GO" ? T.success : T.error, fontWeight: 600, whiteSpace: "nowrap", cursor: "pointer" }}
+                      onClick={() => setExpandedResult(expandedResult === art.id ? null : art.id)}>
+                      {cr.finalcheckVerdict === "GO" ? "🟢GO" : "🔴NO GO"} {cr.factcheckCritical > 0 ? `🔴${cr.factcheckCritical}` : ""}{cr.factcheckWarning > 0 ? ` 🟡${cr.factcheckWarning}` : ""}
+                    </span>
+                  )}
+                  {/* Check button (only for writing_review) */}
+                  {isWritingReview && (
+                    <button onClick={() => copyCheckCommand(art.project || art.name)} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "#7C3AED15", color: "#7C3AED", border: `1px solid #7C3AED33`, cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>🔍 チェック</button>
+                  )}
+                  {/* Progress dots: green=done, red/blue=current, gray=future */}
+                  <div style={{ display: "flex", gap: 3 }}>
+                    {ART_STEPS.map((s, i) => (
+                      <div key={s.id} style={{
+                        width: 8, height: 8, borderRadius: "50%",
+                        background: i < stepIdx ? T.success : i === stepIdx ? badgeColor : T.border,
+                        transition: "background 0.2s",
+                      }} />
+                    ))}
+                  </div>
                   {art.deadline && <span style={{ fontSize: 9, color: T.warning }}>〆 {dlDisplay(art.deadline)}</span>}
-                  <button onClick={() => advanceArticle(art.id)} disabled={art.status === "published"} style={{ fontSize: 12, background: "none", border: "none", cursor: "pointer", color: step.color, opacity: art.status === "published" ? 0.2 : 1 }}>▶</button>
-                  <button onClick={() => setExpandedArt(expanded ? null : art.id)} style={{ fontSize: 10, background: "none", border: "none", cursor: "pointer", color: T.textMuted }}>{expanded ? "▼" : "▶"}</button>
+                  {/* Add to today's tasks (only if self-waiting) */}
+                  {isSelf && (
+                    <button onClick={async () => {
+                      await insertTaskDB(todayKey(), { name: `${curStep.label}：${art.project}`, project: art.project, estimateSec: 1800 });
+                      setToast(`📋 今日のタスクに追加: ${curStep.label}：${art.project}`);
+                    }} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: T.warning + "15", color: T.warning, border: "none", cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>📋 今日</button>
+                  )}
+                  {/* Advance button */}
+                  <button onClick={() => stepIdx === ART_STEP_IDS.length - 1 ? (async () => { setArticles((prev) => prev.map((a) => (a.id === art.id ? { ...a, status: "done" } : a))); await updateTaskDB(art.id, { status: "done" }); })() : advanceArticle(art.id)} style={{ fontSize: 12, background: "none", border: "none", cursor: "pointer", color: stepIdx === ART_STEP_IDS.length - 1 ? T.success : badgeColor, fontFamily: T.font }}>
+                    {stepIdx === ART_STEP_IDS.length - 1 ? "完了✓" : "次へ→"}
+                  </button>
+                  <button onClick={() => setExpandedArt(expanded ? null : art.id)} style={{ fontSize: 10, background: "none", border: "none", cursor: "pointer", color: T.textMuted, fontFamily: T.font }}>{expanded ? "▼" : "▶"}</button>
                 </div>
-                {/* Progress dots */}
-                <div style={{ display: "flex", gap: 3, marginTop: 6, marginLeft: 30 }}>
-                  {ART_STEPS.map((s, i) => {
-                    const artIdx = ART_STEPS.findIndex((x) => x.id === art.status);
-                    return <div key={s.id} style={{ width: 8, height: 8, borderRadius: "50%", background: i <= artIdx ? step.color : T.border, transition: "background 0.2s" }} />;
-                  })}
-                </div>
+                {/* Check result details (expandable) */}
+                {expandedResult === art.id && cr && (
+                  <div style={{ marginTop: 8, padding: "8px 10px", background: T.bg, borderRadius: T.radiusXs, border: `1px solid ${T.border}`, fontSize: 11 }}>
+                    <div style={{ fontWeight: 600, color: T.text, marginBottom: 6 }}>🔍 チェック結果 ({(cr.checkedAt || "").slice(0, 10)})</div>
+                    <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 6 }}>
+                      <span style={{ color: T.text }}>ファクトチェック: <span style={{ color: T.error, fontWeight: 600 }}>🔴{cr.factcheckCritical}</span> <span style={{ color: T.warning, fontWeight: 600 }}>🟡{cr.factcheckWarning}</span> <span style={{ color: T.accent, fontWeight: 600 }}>🔵{cr.factcheckInfo}</span></span>
+                      <span style={{ color: T.text }}>誤字脱字: <span style={{ fontWeight: 600 }}>{cr.finalcheckTypos}件</span></span>
+                      <span style={{ color: cr.finalcheckVerdict === "GO" ? T.success : T.error, fontWeight: 700 }}>{cr.finalcheckVerdict === "GO" ? "🟢 GO" : "🔴 NO GO"}</span>
+                      {cr.commentsInserted > 0 && <span style={{ color: T.textMuted }}>💬 {cr.commentsInserted}件コメント挿入済</span>}
+                    </div>
+                    {cr.factcheckDetail && (
+                      <details style={{ marginTop: 4 }}>
+                        <summary style={{ fontSize: 10, color: T.textMuted, cursor: "pointer" }}>ファクトチェック詳細</summary>
+                        <pre style={{ fontSize: 9, color: T.textDim, whiteSpace: "pre-wrap", maxHeight: 200, overflowY: "auto", marginTop: 4, padding: 6, background: T.bgCard, borderRadius: 4 }}>{cr.factcheckDetail}</pre>
+                      </details>
+                    )}
+                    {cr.finalcheckDetail && (
+                      <details style={{ marginTop: 4 }}>
+                        <summary style={{ fontSize: 10, color: T.textMuted, cursor: "pointer" }}>最終チェック詳細</summary>
+                        <pre style={{ fontSize: 9, color: T.textDim, whiteSpace: "pre-wrap", maxHeight: 200, overflowY: "auto", marginTop: 4, padding: 6, background: T.bgCard, borderRadius: 4 }}>{cr.finalcheckDetail}</pre>
+                      </details>
+                    )}
+                  </div>
+                )}
                 {/* Expanded controls */}
                 {expanded && (
-                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
                     <select value={art.status} onChange={async (e) => { setArticles((prev) => prev.map((a) => (a.id === art.id ? { ...a, status: e.target.value } : a))); await updateTaskDB(art.id, { status: e.target.value }); }} style={{ padding: "4px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }}>
                       {ART_STEPS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+                      <option value="done">✅ 完了</option>
                     </select>
                     <Btn variant="danger" onClick={() => deleteArticle(art.id)} style={{ fontSize: 10, padding: "3px 10px" }}>🗑 削除</Btn>
                   </div>
@@ -764,12 +880,112 @@ export default function TaskManagementView() {
             );
           })}
 
+          {/* ── Completed articles ── */}
+          {doneCount > 0 && (
+            <div style={{ marginTop: 4 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: T.success, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                ✅ 完了 ({doneCount}件)
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {filteredArticles.filter((a) => a.status === "done").map((art) => {
+                  const expanded = expandedArt === art.id;
+                  return (
+                    <Card key={art.id} style={{ border: `1px solid ${T.success}22`, opacity: 0.75 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontSize: 10, padding: "3px 10px", borderRadius: 6, background: T.success + "15", color: T.success, fontWeight: 600, whiteSpace: "nowrap" }}>
+                          ✅ 完了
+                        </span>
+                        <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>{art.project || art.name}</span>
+                        {/* All dots green */}
+                        <div style={{ display: "flex", gap: 3 }}>
+                          {ART_STEPS.map((s) => (
+                            <div key={s.id} style={{ width: 8, height: 8, borderRadius: "50%", background: T.success }} />
+                          ))}
+                        </div>
+                        <button onClick={() => setExpandedArt(expanded ? null : art.id)} style={{ fontSize: 10, background: "none", border: "none", cursor: "pointer", color: T.textMuted, fontFamily: T.font }}>{expanded ? "▼" : "▶"}</button>
+                      </div>
+                      {expanded && (
+                        <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                          <select value={art.status} onChange={async (e) => { setArticles((prev) => prev.map((a) => (a.id === art.id ? { ...a, status: e.target.value } : a))); await updateTaskDB(art.id, { status: e.target.value }); }} style={{ padding: "4px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }}>
+                            {ART_STEPS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+                            <option value="done">✅ 完了</option>
+                          </select>
+                          <Btn variant="danger" onClick={() => deleteArticle(art.id)} style={{ fontSize: 10, padding: "3px 10px" }}>🗑 削除</Btn>
+                        </div>
+                      )}
+                    </Card>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ── Check Results Summary ── */}
+          {checkResults.length > 0 && (
+            <Card style={{ borderLeft: "4px solid #7C3AED", marginTop: 4 }}>
+              <details>
+                <summary style={{ fontSize: 12, fontWeight: 600, color: T.text, cursor: "pointer" }}>
+                  🔍 チェック結果サマリー ({checkResults.length}件)
+                  {(() => { const go = checkResults.filter(r => r.finalcheckVerdict === "GO").length; const nogo = checkResults.filter(r => r.finalcheckVerdict === "NO_GO").length; return ` — 🟢${go} / 🔴${nogo}`; })()}
+                </summary>
+                <div style={{ marginTop: 8, overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
+                    <thead>
+                      <tr style={{ borderBottom: `2px solid ${T.border}` }}>
+                        <th style={{ textAlign: "left", padding: "4px 6px", color: T.textMuted, fontSize: 9 }}>KW</th>
+                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>FC 🔴</th>
+                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>FC 🟡</th>
+                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>誤字</th>
+                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>判定</th>
+                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>💬</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {checkResults.map((r) => (
+                        <tr key={r.id} style={{ borderBottom: `1px solid ${T.border}33` }}>
+                          <td style={{ padding: "4px 6px", color: T.text }}>{truncate(r.keyword, 20)}</td>
+                          <td style={{ textAlign: "center", padding: "4px 4px", color: r.factcheckCritical > 0 ? T.error : T.textDim, fontWeight: r.factcheckCritical > 0 ? 600 : 400 }}>{r.factcheckCritical}</td>
+                          <td style={{ textAlign: "center", padding: "4px 4px", color: r.factcheckWarning > 0 ? T.warning : T.textDim, fontWeight: r.factcheckWarning > 0 ? 600 : 400 }}>{r.factcheckWarning}</td>
+                          <td style={{ textAlign: "center", padding: "4px 4px", color: r.finalcheckTypos > 0 ? T.error : T.textDim, fontWeight: r.finalcheckTypos > 0 ? 600 : 400 }}>{r.finalcheckTypos}</td>
+                          <td style={{ textAlign: "center", padding: "4px 4px", color: r.finalcheckVerdict === "GO" ? T.success : T.error, fontWeight: 700 }}>{r.finalcheckVerdict === "GO" ? "🟢" : "🔴"}</td>
+                          <td style={{ textAlign: "center", padding: "4px 4px", color: T.textDim }}>{r.commentsInserted || 0}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div style={{ marginTop: 6, textAlign: "right" }}>
+                    <button onClick={reloadCheckResults} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "none", border: `1px solid ${T.border}`, color: T.textMuted, cursor: "pointer", fontFamily: T.font }}>🔄 更新</button>
+                  </div>
+                </div>
+              </details>
+            </Card>
+          )}
+
+          {/* ── Check Command Modal ── */}
+          {checkCmd && (
+            <Card style={{ border: `2px solid #7C3AED44`, background: "#7C3AED08" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: T.text, marginBottom: 8 }}>🔍 記事チェック実行</div>
+              <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 6 }}>以下のコマンドをターミナルで実行してください（クリップボードにコピー済み）:</div>
+              <div style={{ padding: "8px 10px", background: T.bg, borderRadius: T.radiusXs, border: `1px solid ${T.border}`, fontFamily: "monospace", fontSize: 10, color: T.text, wordBreak: "break-all", marginBottom: 8 }}>
+                {checkCmd.cmd}
+              </div>
+              <div style={{ fontSize: 10, color: T.textDim, marginBottom: 8 }}>
+                オプション: <code style={{ background: T.bgCard, padding: "1px 4px", borderRadius: 2 }}>--dry-run</code> で対象確認 / <code style={{ background: T.bgCard, padding: "1px 4px", borderRadius: 2 }}>--check-type factcheck</code> でファクトチェックのみ
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => { navigator.clipboard.writeText(checkCmd.cmd); setToast("📋 コピーしました"); }} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 4, background: "#7C3AED", color: "#fff", border: "none", cursor: "pointer", fontFamily: T.font }}>📋 再コピー</button>
+                <button onClick={() => setCheckCmd(null)} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 4, background: "none", border: `1px solid ${T.border}`, color: T.textMuted, cursor: "pointer", fontFamily: T.font }}>閉じる</button>
+                <button onClick={() => { reloadCheckResults(); setToast("🔄 結果を更新しました"); }} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 4, background: "none", border: `1px solid ${T.border}`, color: T.textMuted, cursor: "pointer", fontFamily: T.font }}>🔄 結果を確認</button>
+              </div>
+            </Card>
+          )}
+
           {/* Add article */}
           <Card style={{ border: `1px solid ${T.border}` }}>
             <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 6 }}>記事案件を追加</div>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {(projects || []).filter((p) => p.articleEnabled || (p.services || []).includes("SEO")).slice(0, 20).map((p) => {
-                const exists = filteredArticles.some((a) => (a.name === p.name || a.project === p.name));
+              {(projects || []).filter((p) => p.articleEnabled || (p.services || []).includes("SEO")).slice(0, 50).map((p) => {
+                const exists = filteredArticles.some((a) => (a.project === p.name || a.name === p.name));
                 return (
                   <button key={p.id} onClick={() => !exists && addArticle(p.name)} disabled={exists} style={{ fontSize: 10, padding: "3px 10px", borderRadius: 99, background: exists ? T.bgCard : T.accent + "12", color: exists ? T.textMuted : T.accent, border: `1px solid ${exists ? T.border : T.accent + "44"}`, cursor: exists ? "default" : "pointer", fontFamily: T.font, opacity: exists ? 0.4 : 1 }}>
                     {exists ? "✓" : "+"} {truncate(p.name, 15)}
@@ -779,7 +995,8 @@ export default function TaskManagementView() {
             </div>
           </Card>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
