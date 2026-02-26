@@ -4,9 +4,9 @@
  * @param {Array} msgs - Messages array
  * @param {number} maxTok - Max tokens (default 4000)
  * @param {boolean} useSearch - Enable web search tool
- * @param {string} model - Model to use (default claude-opus-4-0-20250514)
+ * @param {string} model - Model to use (default claude-opus-4-6)
  */
-export const callAPI = async (sys, msgs, maxTok = 4000, useSearch = false, model = "claude-opus-4-0-20250514") => {
+export const callAPI = async (sys, msgs, maxTok = 4000, useSearch = false, model = "claude-opus-4-6") => {
   try {
     const body = {
       model,
