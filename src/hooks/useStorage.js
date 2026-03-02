@@ -135,6 +135,47 @@ export const fetchTasksByDate = async (dateKey) => {
   return data.map(mapTaskRow);
 };
 
+/**
+ * Fetch tasks for a date view:
+ * - Only tasks whose task_date = dateKey
+ * - Overdue project tasks are handled separately via todayProjTasks in the component
+ */
+export const fetchTasksForDateView = async (dateKey) => {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .eq("task_date", dateKey)
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    console.error("fetchTasksForDateView:", error);
+    return [];
+  }
+  return (data || []).map(mapTaskRow);
+};
+
+/**
+ * Fetch ALL active daily tasks (not done), regardless of date.
+ * Includes tasks with task_type = 'daily' or null (backwards compat).
+ * Excludes delegation/inprogress/article (shown in their own sections).
+ * Sorted by deadline ascending (null deadlines last).
+ */
+export const fetchAllActiveTasks = async () => {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .eq("done", false)
+    .or("task_type.eq.daily,task_type.is.null")
+    .order("deadline", { ascending: true, nullsFirst: false });
+  if (error) {
+    console.error("fetchAllActiveTasks:", error);
+    return [];
+  }
+  return data.map(mapTaskRow);
+};
+
 export const fetchTasksByType = async (taskType) => {
   const { data, error } = await supabase
     .from("tasks")
@@ -242,6 +283,75 @@ export const deleteTask = async (id) => {
     .eq("id", id)
     .eq("user_id", USER_ID);
   if (error) console.error("deleteTask:", error);
+};
+
+// Update task by linkId (for cross-system sync from ClientDashboard)
+export const updateTaskByLinkId = async (linkId, updates) => {
+  if (!linkId) return;
+  const mapped = {};
+  if (updates.done !== undefined) mapped.done = updates.done;
+  if (updates.name !== undefined) mapped.name = updates.name;
+  if (updates.deadline !== undefined) mapped.deadline = updates.deadline;
+  if (updates.memo !== undefined) mapped.memo = updates.memo;
+  const { error } = await supabase.from("tasks").update(mapped).eq("link_id", linkId).eq("user_id", USER_ID);
+  if (error) console.error("updateTaskByLinkId:", error);
+};
+
+// Delete task by linkId (for cross-system sync from ClientDashboard)
+export const deleteTaskByLinkId = async (linkId) => {
+  if (!linkId) return;
+  const { error } = await supabase.from("tasks").delete().eq("link_id", linkId).eq("user_id", USER_ID);
+  if (error) console.error("deleteTaskByLinkId:", error);
+};
+
+// Sync project tasks to tasks table (one-time migration for existing tasks)
+export const syncProjectTasksToDb = async (projects) => {
+  if (!projects || projects.length === 0) return;
+  // Collect all linkIds from project tasks
+  const allProjectTasks = [];
+  for (const p of projects) {
+    for (const t of (p.tasks || [])) {
+      if (t.linkId && !t.done) {
+        allProjectTasks.push({ ...t, projectName: p.name });
+      }
+    }
+  }
+  if (allProjectTasks.length === 0) return;
+
+  // Check which linkIds already exist in tasks table
+  const linkIds = allProjectTasks.map((t) => t.linkId);
+  const { data: existing } = await supabase
+    .from("tasks")
+    .select("link_id")
+    .eq("user_id", USER_ID)
+    .in("link_id", linkIds);
+  const existingSet = new Set((existing || []).map((r) => r.link_id));
+
+  // Insert missing tasks
+  const toInsert = allProjectTasks.filter((t) => !existingSet.has(t.linkId));
+  if (toInsert.length === 0) return;
+
+  const rows = toInsert.map((t) => ({
+    user_id: USER_ID,
+    task_date: t.date || new Date().toISOString().slice(0, 10),
+    name: t.text,
+    estimate_sec: 1800,
+    elapsed_sec: 0,
+    done: false,
+    timer_running: false,
+    project: t.projectName,
+    task_type: "daily",
+    deadline: t.deadline || null,
+    link_id: t.linkId,
+    client_name: t.projectName,
+  }));
+
+  const { error } = await supabase.from("tasks").insert(rows);
+  if (error) {
+    console.error("syncProjectTasksToDb:", error);
+  } else {
+    console.log(`✅ ${rows.length}件のクライアントタスクを同期`);
+  }
 };
 
 // ========================
@@ -475,7 +585,7 @@ export const fetchRecurring = async () => {
     name: row.name,
     project: row.project,
     estimateSec: row.estimate_sec,
-    dayOfWeek: row.day_of_week,
+    dayOfMonth: row.day_of_week,
     createdAt: row.created_at,
   }));
 };
@@ -486,7 +596,7 @@ export const upsertRecurring = async (item) => {
     name: item.name,
     project: item.project || null,
     estimate_sec: item.estimateSec || 1800,
-    day_of_week: item.dayOfWeek != null ? item.dayOfWeek : null,
+    day_of_week: item.dayOfMonth != null ? item.dayOfMonth : null,
   };
   if (item.id) {
     const { error } = await supabase.from("recurring_tasks").update(payload).eq("id", item.id);
@@ -501,6 +611,27 @@ export const upsertRecurring = async (item) => {
 export const deleteRecurring = async (id) => {
   const { error } = await supabase.from("recurring_tasks").delete().eq("id", id).eq("user_id", USER_ID);
   if (error) console.error("deleteRecurring:", error);
+};
+
+export const autoInsertRecurringTasks = async (dateKey, recurringList) => {
+  const dayOfMonth = new Date(dateKey).getDate();
+  const matching = recurringList.filter((r) => r.dayOfMonth === dayOfMonth);
+  if (matching.length === 0) return 0;
+  const existing = await fetchTasksByDate(dateKey);
+  let inserted = 0;
+  for (const r of matching) {
+    const alreadyExists = existing.some((t) => t.name === r.name && t.project === r.project);
+    if (!alreadyExists) {
+      await insertTask(dateKey, {
+        name: r.name,
+        project: r.project || null,
+        estimateSec: r.estimateSec || 1800,
+        taskType: "daily",
+      });
+      inserted++;
+    }
+  }
+  return inserted;
 };
 
 // ========================

@@ -1,19 +1,31 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { T } from "../../lib/constants";
-import { todayKey, dateLabel, dlDate, dlTime, dlJoin, dlDisplay, toMMDD, curMonth, monthLabel, prevMonthKey, nextMonthKey, toISO, fmtDateInput } from "../../lib/dates";
+import { todayKey, dateLabel, dlDate, dlTime, dlJoin, dlDisplay, curMonth, monthLabel, prevMonthKey, nextMonthKey, toISO, fmtDateInput } from "../../lib/dates";
 import { fmtSec, truncate } from "../../lib/format";
 import { callAPIQuick } from "../../lib/api";
 import {
   fetchTasksByDate,
+  fetchTasksForDateView,
+  fetchAllActiveTasks,
   fetchTasksByType,
   insertTask as insertTaskDB,
   updateTask as updateTaskDB,
   deleteTask as deleteTaskDB,
   fetchCheckResults,
+  upsertProject,
+  updateTaskByLinkId,
+  autoInsertRecurringTasks,
 } from "../../hooks/useStorage";
 import { useApp } from "../../contexts/AppContext";
 import Card from "../ui/Card";
 import Btn from "../ui/Btn";
+
+const CAT_COLORS = {
+  "制作": { color: "#3B82F6" },
+  "SEO": { color: "#10B981" },
+  "広告": { color: "#F59E0B" },
+  "LINE": { color: "#06D001" },
+};
 
 // Article pipeline statuses (legacy-compatible 7 stages)
 // self: true = 自分待ち（赤バッジ）, false = 業者待ち（青バッジ）
@@ -36,8 +48,8 @@ const BALL_HOLDERS = [
   { id: "designer", label: "デザイナー", color: "#F472B6" },
 ];
 
-export default function TaskManagementView() {
-  const { projects, saveProjects, syncTaskStatus, handleTaskExecute, setToast } = useApp();
+export default function TaskManagementView({ onNavigateToClient }) {
+  const { projects, saveProjects, syncTaskStatus, handleTaskExecute, setToast, recurring, saveRecurring, removeRecurring } = useApp();
 
   const [tmTab, setTmTab] = useState("today");
   const [date, setDate] = useState(todayKey());
@@ -78,23 +90,140 @@ export default function TaskManagementView() {
   const [checkResults, setCheckResults] = useState([]);
   const [checkCmd, setCheckCmd] = useState(null); // {project, month} for command modal
   const [expandedResult, setExpandedResult] = useState(null);
+  const [checkingJobs, setCheckingJobs] = useState({}); // projectName -> {jobId, status, progress, total, step, article}
+
+  // Monthly recurring form
+  const [addingMonthly, setAddingMonthly] = useState(false);
+  const [monthlyName, setMonthlyName] = useState("");
+  const [monthlyProject, setMonthlyProject] = useState("");
+  const [monthlyDay, setMonthlyDay] = useState(1);
+  const [editingMonthly, setEditingMonthly] = useState(null);
+  const [showArchive, setShowArchive] = useState(false);
+  const [showListInprog, setShowListInprog] = useState(false);
+  const [showListDeleg, setShowListDeleg] = useState(false);
+  const [addingFromInprog, setAddingFromInprog] = useState(null); // inprog task id
+  const [fromInprogName, setFromInprogName] = useState("");
+  const [exportText, setExportText] = useState("");
+  const [inprogSectionOpen, setInprogSectionOpen] = useState(false);
+  const [doneSectionOpen, setDoneSectionOpen] = useState(false);
 
   // Editing states
   const [editingTask, setEditingTask] = useState(null);
   const [editingMemo, setEditingMemo] = useState(null);
   const [memoText, setMemoText] = useState("");
+  const [editDL, setEditDL] = useState(null); // { id, val } for inline deadline editing
+  const [editingProjTask, setEditingProjTask] = useState(null); // { _pid, id, text, estimateMin }
+  const [editingProjMemo, setEditingProjMemo] = useState(null); // proj task id
+  const [projMemoText, setProjMemoText] = useState("");
 
-  // Quick timer
-  const [qtRunning, setQtRunning] = useState(false);
-  const [qtStartedAt, setQtStartedAt] = useState(null);
+  // Quick timer (restored from localStorage)
+  const [qtRunning, setQtRunning] = useState(() => {
+    try { const s = localStorage.getItem("mkt_qt"); if (s) { const d = JSON.parse(s); return d.running || false; } } catch {} return false;
+  });
+  const [qtStartedAt, setQtStartedAt] = useState(() => {
+    try { const s = localStorage.getItem("mkt_qt"); if (s) { const d = JSON.parse(s); return d.startedAt || null; } } catch {} return null;
+  });
+  const [qtCount, setQtCount] = useState(0);
+
+  // All active tasks for "list" tab
+  const [allActiveTasks, setAllActiveTasks] = useState([]);
+  const [listPage, setListPage] = useState(0);
+  const LIST_PAGE_SIZE = 20;
+
+  // Project task timers (restored from localStorage)
+  const [projTimers, setProjTimers] = useState(() => {
+    try { const s = localStorage.getItem("mkt_projTimers"); if (s) return JSON.parse(s); } catch {} return {};
+  });
+
+  // Persist quick timer to localStorage
+  useEffect(() => {
+    localStorage.setItem("mkt_qt", JSON.stringify({ running: qtRunning, startedAt: qtStartedAt }));
+  }, [qtRunning, qtStartedAt]);
+
+  // Persist project timers to localStorage
+  useEffect(() => {
+    localStorage.setItem("mkt_projTimers", JSON.stringify(projTimers));
+  }, [projTimers]);
+
+  // Initialize projTimers from project task data (Supabase is source of truth)
+  const projTimersInitialized = useRef(false);
+  useEffect(() => {
+    if (projTimersInitialized.current || !projects || projects.length === 0) return;
+    projTimersInitialized.current = true;
+    setProjTimers((prev) => {
+      const fromDb = {};
+      for (const p of projects) {
+        for (const t of (p.tasks || [])) {
+          if (t.elapsedSec > 0) {
+            fromDb[t.id] = { running: false, startedAt: null, elapsed: t.elapsedSec };
+          }
+        }
+      }
+      // Merge: prefer higher elapsed value (Supabase or localStorage)
+      const merged = { ...prev };
+      for (const [k, v] of Object.entries(fromDb)) {
+        if (!merged[k] || (v.elapsed || 0) > (merged[k].elapsed || 0)) {
+          merged[k] = v;
+        }
+      }
+      return merged;
+    });
+  }, [projects]);
+
+  // Auto-save running project timers to Supabase every 60 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      for (const [taskId, pt] of Object.entries(projTimers)) {
+        if (pt.running && pt.startedAt) {
+          const elapsed = (pt.elapsed || 0) + Math.floor((Date.now() - pt.startedAt) / 1000);
+          const proj = (projects || []).find(p => (p.tasks || []).some(t => t.id === taskId));
+          if (proj) {
+            const updatedTasks = (proj.tasks || []).map(t =>
+              t.id === taskId ? { ...t, elapsedSec: elapsed } : t
+            );
+            upsertProject({ ...proj, tasks: updatedTasks });
+          }
+        }
+      }
+    }, 60000);
+    return () => clearInterval(interval);
+  }, [projTimers, projects]);
+
+  // Save timer state when tab becomes hidden (sleep, screen lock, switch tabs)
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.hidden) {
+        for (const [taskId, pt] of Object.entries(projTimers)) {
+          if (pt.running && pt.startedAt) {
+            const elapsed = (pt.elapsed || 0) + Math.floor((Date.now() - pt.startedAt) / 1000);
+            const proj = (projects || []).find(p => (p.tasks || []).some(t => t.id === taskId));
+            if (proj) {
+              const updatedTasks = (proj.tasks || []).map(t =>
+                t.id === taskId ? { ...t, elapsedSec: elapsed } : t
+              );
+              upsertProject({ ...proj, tasks: updatedTasks });
+            }
+          }
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, [projTimers, projects]);
 
   // ── Data loading ──
   const loadDayTasks = useCallback(async () => {
     setLoadingTasks(true);
-    const tasks = await fetchTasksByDate(date);
+    // Fetch tasks for the date view: tasks added to this date + tasks with deadline ≤ this date
+    const tasks = await fetchTasksForDateView(date);
     setDayTasks(tasks);
     setLoadingTasks(false);
   }, [date]);
+
+  const loadAllActive = useCallback(async () => {
+    const tasks = await fetchAllActiveTasks();
+    setAllActiveTasks(tasks);
+  }, []);
 
   const loadSpecialTasks = useCallback(async () => {
     try {
@@ -114,6 +243,18 @@ export default function TaskManagementView() {
   useEffect(() => { loadDayTasks(); }, [loadDayTasks]);
   useEffect(() => { loadSpecialTasks(); }, [loadSpecialTasks]);
 
+  // Auto-insert recurring tasks for the current date
+  const recurringInserted = useRef(new Set());
+  useEffect(() => {
+    if (recurring.length > 0 && date && !recurringInserted.current.has(date)) {
+      recurringInserted.current.add(date);
+      autoInsertRecurringTasks(date, recurring).then((count) => {
+        if (count > 0) loadDayTasks();
+      });
+    }
+  }, [date, recurring, loadDayTasks]);
+  useEffect(() => { if (tmTab === "list") loadAllActive(); }, [tmTab, loadAllActive]);
+
   // Load check results when article month changes
   useEffect(() => {
     if (tmTab === "articles") {
@@ -128,16 +269,66 @@ export default function TaskManagementView() {
   }, []);
 
   // ── Helpers ──
+  const dl = (v) => (v || "").slice(0, 10); // normalize deadline to YYYY-MM-DD
   const getElapsed = (task) => {
     let base = task.elapsedSec || 0;
     if (task.running && task.runStartedAt) base += Math.floor((Date.now() - task.runStartedAt) / 1000);
     return base;
   };
 
-  const completed = dayTasks.filter((t) => t.done).length;
-  const total = dayTasks.length;
-  const totalEstimate = dayTasks.reduce((s, t) => s + (t.estimateSec || 0), 0);
-  const totalElapsed = dayTasks.reduce((s, t) => s + getElapsed(t), 0);
+  // Project deadline tasks for the selected date + overdue (not done) tasks
+  // Completed tasks: show on completedAt date (fallback to deadline if no completedAt)
+  const todayProjTasks = useMemo(() => {
+    const result = [];
+    (projects || []).forEach((p) => {
+      const pcc = (CAT_COLORS[(p.services || [p.category])[0]] || CAT_COLORS["SEO"]);
+      (p.tasks || []).forEach((t) => {
+        if (!t.deadline) return;
+        const d = dl(t.deadline);
+        if (t.done) {
+          // Completed: show on completedAt date (fallback to deadline)
+          const compDate = t.completedAt ? dl(t.completedAt) : d;
+          if (compDate === date) {
+            result.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color });
+          }
+        } else {
+          // Not done: show on deadline date + overdue carry-over
+          if (d === date) {
+            result.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color, _isOverdue: !!t.rescheduledFrom });
+          } else if (d < date) {
+            result.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color, _isOverdue: true });
+          }
+        }
+      });
+    });
+    return result;
+  }, [projects, date]);
+
+  // Dedup: exclude project tasks already in dayTasks (by linkId)
+  const dayTaskLinkIds = useMemo(() => new Set(dayTasks.filter(t => t.linkId).map(t => t.linkId)), [dayTasks]);
+  const extraProjTasks = useMemo(() => todayProjTasks.filter(t => !t.linkId || !dayTaskLinkIds.has(t.linkId)), [todayProjTasks, dayTaskLinkIds]);
+  // Split project tasks: regular (default) vs inprog (taskType === "inprogress")
+  const regularProjTasks = useMemo(() => extraProjTasks.filter(t => t.taskType !== "inprogress"), [extraProjTasks]);
+  const overdueCount = useMemo(() => regularProjTasks.filter(t => t._isOverdue && !t.done).length, [regularProjTasks]);
+  // In-progress project tasks: always show all (not filtered by date)
+  const inprogProjTasks = useMemo(() => {
+    const result = [];
+    (projects || []).forEach((p) => {
+      const pcc = (CAT_COLORS[(p.services || [p.category])[0]] || CAT_COLORS["SEO"]);
+      (p.tasks || []).forEach((t) => {
+        if (t.taskType === "inprogress" && !t.done) {
+          result.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color });
+        }
+      });
+    });
+    return result;
+  }, [projects]);
+
+  const visibleDayTasks = useMemo(() => dayTasks.filter((t) => !dl(t.deadline) || dl(t.deadline) === date), [dayTasks, date]);
+  const completed = visibleDayTasks.filter((t) => t.done).length + regularProjTasks.filter(t => t.done).length;
+  const total = visibleDayTasks.length + regularProjTasks.length;
+  const totalEstimate = visibleDayTasks.reduce((s, t) => s + (t.estimateSec || 0), 0) + regularProjTasks.reduce((s, t) => s + (t.estimateSec || 0), 0);
+  const totalElapsed = visibleDayTasks.reduce((s, t) => s + getElapsed(t), 0) + regularProjTasks.reduce((s, t) => { try { const pt = projTimers[t.id]; if (!pt) return s; let base = pt.elapsed || 0; if (pt.running && pt.startedAt) base += Math.floor((Date.now() - pt.startedAt) / 1000); return s + base; } catch { return s; } }, 0);
   const pendingDelegCount = delegations.filter((d) => !d.done && d.status !== "done").length;
 
   // ── Daily Task CRUD ──
@@ -190,17 +381,19 @@ export default function TaskManagementView() {
       if (t.id !== id) return t;
       if (!t.done) {
         const extra = t.running && t.runStartedAt ? Math.floor((Date.now() - t.runStartedAt) / 1000) : 0;
-        const u = { ...t, done: true, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null };
+        const u = { ...t, done: true, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null, completedAt: new Date().toISOString() };
         updateTaskDB(id, u);
         if (u.linkId) syncTaskStatus(u.linkId, true);
         return u;
       }
-      const u = { ...t, done: false };
+      const u = { ...t, done: false, completedAt: null };
       updateTaskDB(id, u);
       if (u.linkId) syncTaskStatus(u.linkId, false);
       return u;
     });
     setDayTasks(updated);
+    // Also refresh the all-active list if it was loaded
+    if (allActiveTasks.length > 0) loadAllActive();
   };
 
   const handleDeleteTask = async (id) => {
@@ -231,6 +424,186 @@ export default function TaskManagementView() {
     setMemoText("");
   };
 
+  // Inline deadline edit
+  const dlSavingRef = useRef(false);
+
+  const saveDeadlineEdit = async (id, mmdd, afterSave) => {
+    if (dlSavingRef.current) return; // Prevent double-save from Enter + Blur
+    dlSavingRef.current = true;
+    const iso = mmdd ? toISO(mmdd) : null;
+    setEditDL(null);
+    try {
+      if (afterSave) await afterSave(id, iso);
+    } finally {
+      dlSavingRef.current = false;
+    }
+  };
+
+  // Helper: update project task deadline (for tasks stored in projects state, not tasks table)
+  const saveProjTaskDeadline = async (projId, taskId, iso) => {
+    const proj = (projects || []).find((p) => p.id === projId);
+    if (!proj) return;
+    const updatedTasks = (proj.tasks || []).map((tk) =>
+      tk.id === taskId ? { ...tk, deadline: iso } : tk
+    );
+    const updated = (projects || []).map((p) =>
+      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
+    );
+    saveProjects(updated);
+    const updatedProj = updated.find((p) => p.id === projId);
+    if (updatedProj) await upsertProject(updatedProj);
+  };
+
+  // Helper: reschedule all overdue project tasks to today
+  const rescheduleOverdueToToday = async () => {
+    const today = todayKey();
+    const todayISO = today + "T00:00:00";
+    let updatedProjects = [...(projects || [])];
+    const affectedProjIds = new Set();
+    updatedProjects = updatedProjects.map((p) => {
+      let changed = false;
+      const newTasks = (p.tasks || []).map((t) => {
+        if (!t.deadline || t.done || t.taskType === "inprogress") return t;
+        const d = dl(t.deadline);
+        if (d < today) {
+          changed = true;
+          return { ...t, deadline: todayISO, rescheduledFrom: t.rescheduledFrom || d };
+        }
+        return t;
+      });
+      if (changed) {
+        affectedProjIds.add(p.id);
+        return { ...p, tasks: newTasks, updatedAt: Date.now() };
+      }
+      return p;
+    });
+    if (affectedProjIds.size === 0) return;
+    saveProjects(updatedProjects);
+    for (const pid of affectedProjIds) {
+      const proj = updatedProjects.find((p) => p.id === pid);
+      if (proj) await upsertProject(proj);
+    }
+    setToast(`📅 ${overdueCount}件のタスクを今日に移動しました`);
+  };
+
+  // Helper: toggle project task type between regular and inprogress
+  const toggleProjTaskType = async (projId, taskId) => {
+    const proj = (projects || []).find((p) => p.id === projId);
+    if (!proj) return;
+    const task = (proj.tasks || []).find((tk) => tk.id === taskId);
+    if (!task) return;
+    const newType = task.taskType === "inprogress" ? "daily" : "inprogress";
+    const updatedTasks = (proj.tasks || []).map((tk) =>
+      tk.id === taskId ? { ...tk, taskType: newType, ballHolder: newType === "inprogress" ? (tk.ballHolder || "self") : undefined } : tk
+    );
+    const updated = (projects || []).map((p) =>
+      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
+    );
+    saveProjects(updated);
+    const updatedProj = updated.find((p) => p.id === projId);
+    if (updatedProj) await upsertProject(updatedProj);
+    setToast(newType === "inprogress" ? "🔄 進行中に変更" : "📋 通常タスクに変更");
+  };
+
+  // Helper: cycle ball holder on project task
+  const cycleProjBallHolder = async (projId, taskId) => {
+    const proj = (projects || []).find((p) => p.id === projId);
+    if (!proj) return;
+    const task = (proj.tasks || []).find((tk) => tk.id === taskId);
+    if (!task) return;
+    const curIdx = BALL_HOLDERS.findIndex((b) => b.id === (task.ballHolder || "self"));
+    const nextBall = BALL_HOLDERS[(curIdx + 1) % BALL_HOLDERS.length].id;
+    const updatedTasks = (proj.tasks || []).map((tk) =>
+      tk.id === taskId ? { ...tk, ballHolder: nextBall } : tk
+    );
+    const updated = (projects || []).map((p) =>
+      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
+    );
+    saveProjects(updated);
+    const updatedProj = updated.find((p) => p.id === projId);
+    if (updatedProj) await upsertProject(updatedProj);
+  };
+
+  // Helper: edit project task (name, estimate)
+  const saveProjTaskEdit = async () => {
+    if (!editingProjTask) return;
+    const { _pid, id, text, estimateMin, elapsedMin } = editingProjTask;
+    const proj = (projects || []).find((p) => p.id === _pid);
+    if (!proj) return;
+    // Include elapsedSec: from edit form if available, otherwise from projTimers
+    const elapsedSec = elapsedMin !== undefined ? (elapsedMin || 0) * 60 : (projTimers[id]?.elapsed || 0);
+    const updatedTasks = (proj.tasks || []).map((tk) =>
+      tk.id === id ? { ...tk, text, estimateSec: (estimateMin || 0) * 60, elapsedSec } : tk
+    );
+    const updated = (projects || []).map((p) =>
+      p.id === _pid ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
+    );
+    saveProjects(updated);
+    const updatedProj = updated.find((p) => p.id === _pid);
+    if (updatedProj) await upsertProject(updatedProj);
+    setEditingProjTask(null);
+  };
+
+  // Helper: save memo on project task
+  const saveProjMemo = async (projId, taskId) => {
+    const proj = (projects || []).find((p) => p.id === projId);
+    if (!proj) return;
+    const updatedTasks = (proj.tasks || []).map((tk) =>
+      tk.id === taskId ? { ...tk, memo: projMemoText || null } : tk
+    );
+    const updated = (projects || []).map((p) =>
+      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
+    );
+    saveProjects(updated);
+    const updatedProj = updated.find((p) => p.id === projId);
+    if (updatedProj) await upsertProject(updatedProj);
+    setEditingProjMemo(null);
+    setProjMemoText("");
+  };
+
+  // Helper: delete project task
+  const deleteProjTask = async (projId, taskId) => {
+    const proj = (projects || []).find((p) => p.id === projId);
+    if (!proj) return;
+    const updatedTasks = (proj.tasks || []).filter((tk) => tk.id !== taskId);
+    const updated = (projects || []).map((p) =>
+      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
+    );
+    saveProjects(updated);
+    const updatedProj = updated.find((p) => p.id === projId);
+    if (updatedProj) await upsertProject(updatedProj);
+  };
+
+  const renderDeadline = (taskId, deadline, { prefix = "〆 ", color = T.warning, overrideColor, fontSize = 9, afterSave, showEmpty = false } = {}) => {
+    const displayColor = overrideColor || color;
+    if (editDL?.id === taskId) {
+      return (
+        <input
+          autoFocus
+          value={editDL.val}
+          onChange={(e) => setEditDL({ ...editDL, val: fmtDateInput(e.target.value) })}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.target.blur(); saveDeadlineEdit(taskId, editDL.val, afterSave); }
+            if (e.key === "Escape") setEditDL(null);
+          }}
+          onBlur={() => saveDeadlineEdit(taskId, editDL.val, afterSave)}
+          placeholder="MM/DD"
+          style={{ width: 56, padding: "2px 5px", background: T.bg, border: `1px solid ${T.accent}`, borderRadius: T.radiusXs, color: T.text, fontSize, fontFamily: T.font, textAlign: "center", outline: "none" }}
+        />
+      );
+    }
+    if (!deadline && !showEmpty) return null;
+    return (
+      <span
+        onClick={(e) => { e.stopPropagation(); setEditDL({ id: taskId, val: deadline ? deadline.slice(5, 10).replace(/-/g, "/") : "" }); }}
+        style={{ fontSize, color: displayColor, cursor: "pointer", flexShrink: 0, whiteSpace: "nowrap" }}
+        title="クリックで日付を編集"
+      >
+        {deadline ? `${prefix}${dlDisplay(deadline)}` : `${prefix}--/--`}
+      </span>
+    );
+  };
+
   // AI Estimate
   const aiEstimate = async (taskName) => {
     setAiEstLoading(true);
@@ -246,17 +619,102 @@ export default function TaskManagementView() {
     setAiEstLoading(false);
   };
 
-  // Quick timer
+  // Quick timer elapsed
+  const getQtElapsed = () => {
+    if (!qtRunning || !qtStartedAt) return 0;
+    return Math.floor((Date.now() - qtStartedAt) / 1000);
+  };
+
+  // Total quick timer seconds for today
+  const qtTotalSec = useMemo(() => {
+    return dayTasks.filter((t) => t.name && t.name.includes("チャット・雑務") && t.done).reduce((s, t) => s + (t.elapsedSec || 0), 0);
+  }, [dayTasks]);
+
   const qtToggle = async () => {
     if (qtRunning) {
       const elapsed = qtStartedAt ? Math.floor((Date.now() - qtStartedAt) / 1000) : 0;
       setQtRunning(false); setQtStartedAt(null);
       if (elapsed > 60) {
-        await insertTaskDB(date, { name: "💬 チャット・雑務", estimateSec: elapsed, elapsedSec: elapsed, done: true, taskType: "daily" });
+        const num = qtCount + 1;
+        setQtCount(num);
+        await insertTaskDB(date, { name: `💬 ${num} チャット・雑務`, estimateSec: elapsed, elapsedSec: elapsed, done: true, taskType: "daily" });
         await loadDayTasks();
       }
     } else {
       setQtRunning(true); setQtStartedAt(Date.now());
+    }
+  };
+
+  // Project deadline task helpers
+  const getProjElapsed = (task) => {
+    const pt = projTimers[task.id];
+    if (!pt) return 0;
+    let base = pt.elapsed || 0;
+    if (pt.running && pt.startedAt) base += Math.floor((Date.now() - pt.startedAt) / 1000);
+    return base;
+  };
+
+  // Persist project task elapsed time to Supabase
+  const persistProjElapsed = useCallback(async (projId, taskId, elapsedSec) => {
+    const proj = (projects || []).find((p) => p.id === projId);
+    if (!proj) return;
+    const updatedTasks = (proj.tasks || []).map((t) =>
+      t.id === taskId ? { ...t, elapsedSec } : t
+    );
+    const updated = (projects || []).map((p) =>
+      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
+    );
+    saveProjects(updated);
+    const updatedProj = updated.find((p) => p.id === projId);
+    if (updatedProj) await upsertProject(updatedProj);
+  }, [projects, saveProjects]);
+
+  const toggleProjTimer = (projId, taskId) => {
+    const pt = projTimers[taskId] || { running: false, startedAt: null, elapsed: 0 };
+    if (pt.running) {
+      // Pausing - calculate elapsed and persist to Supabase
+      const extra = pt.startedAt ? Math.floor((Date.now() - pt.startedAt) / 1000) : 0;
+      const newElapsed = (pt.elapsed || 0) + extra;
+      setProjTimers((prev) => ({ ...prev, [taskId]: { running: false, startedAt: null, elapsed: newElapsed } }));
+      persistProjElapsed(projId, taskId, newElapsed);
+    } else {
+      // Starting - stop other running timers and persist their elapsed
+      const next = {};
+      for (const [k, v] of Object.entries(projTimers)) {
+        if (v.running) {
+          const extra = v.startedAt ? Math.floor((Date.now() - v.startedAt) / 1000) : 0;
+          const newElapsed = (v.elapsed || 0) + extra;
+          next[k] = { running: false, startedAt: null, elapsed: newElapsed };
+          // Persist the stopped timer
+          const ownerProj = (projects || []).find(p => (p.tasks || []).some(t => t.id === k));
+          if (ownerProj) persistProjElapsed(ownerProj.id, k, newElapsed);
+        } else {
+          next[k] = v;
+        }
+      }
+      next[taskId] = { running: true, startedAt: Date.now(), elapsed: pt.elapsed || 0 };
+      setProjTimers(next);
+    }
+  };
+
+  const toggleProjDone = async (projId, taskId) => {
+    const proj = (projects || []).find((p) => p.id === projId);
+    if (!proj) return;
+    const task = (proj.tasks || []).find((t) => t.id === taskId);
+    if (!task) return;
+    const newDone = !task.done;
+    const updatedTasks = (proj.tasks || []).map((t) =>
+      t.id === taskId ? { ...t, done: newDone, completedAt: newDone ? new Date().toISOString() : null } : t
+    );
+    const updated = (projects || []).map((p) =>
+      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
+    );
+    saveProjects(updated);
+    const updatedProj = updated.find((p) => p.id === projId);
+    if (updatedProj) await upsertProject(updatedProj);
+    if (task.linkId) {
+      syncTaskStatus(task.linkId, newDone);
+      await updateTaskByLinkId(task.linkId, { done: newDone });
     }
   };
 
@@ -271,7 +729,7 @@ export default function TaskManagementView() {
     await loadSpecialTasks();
     setDelegName(""); setDelegProject(""); setDelegAssignee(""); setDelegDeadline(""); setDelegMemo("");
     setAddingDeleg(false);
-    setToast("✅ 委任タスク追加");
+    setToast("✅ 依頼タスク追加");
   };
 
   const cycleDelegStatus = async (id) => {
@@ -304,6 +762,22 @@ export default function TaskManagementView() {
     setIpName(""); setIpProject(""); setIpBall("self"); setIpDeadline("");
     setAddingInprog(false);
     setToast("✅ 進行中タスク追加");
+  };
+
+  // Add a daily task from an in-progress task
+  const addTaskFromInprog = async (inprogTask) => {
+    if (!fromInprogName.trim()) return;
+    await insertTaskDB(date, {
+      name: fromInprogName.trim(),
+      project: inprogTask.project || null,
+      estimateSec: 1800,
+      taskType: "daily",
+      status: "inprog_child",
+    });
+    await loadDayTasks();
+    setFromInprogName("");
+    setAddingFromInprog(null);
+    setToast("✅ 自分タスク追加");
   };
 
   const toggleInprogDone = async (id) => {
@@ -366,6 +840,72 @@ export default function TaskManagementView() {
     return checkResults.find((r) => r.projectName === projectName && r.status === "done");
   };
 
+  const CHECK_API = import.meta.env.VITE_CHECK_API || "http://localhost:8765";
+
+  const startArticleCheck = async (projectName) => {
+    // Try API server - server reads spreadsheet for articles
+    try {
+      const res = await fetch(`${CHECK_API}/api/check`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: projectName, month: artMonthFilter }),
+      });
+      const data = await res.json();
+
+      if (data.error === "already_running") {
+        setToast("⚡ このプロジェクトは既にチェック中です");
+        return;
+      }
+      if (data.job_id) {
+        setCheckingJobs((prev) => ({ ...prev, [projectName]: { jobId: data.job_id, status: "running", progress: 0, total: artList.length, step: "開始中...", article: "" } }));
+        setToast(`🔍 ${projectName} のチェックを開始しました`);
+        // Start polling
+        pollCheckStatus(projectName, data.job_id);
+        return;
+      }
+    } catch {
+      // API server not running - fallback to copy command
+    }
+
+    // Fallback: copy command
+    const cmd = `cd ~/Downloads/seo-agent-project/seo-checker && python agent.py --month ${artMonthFilter} --project "${projectName}"`;
+    navigator.clipboard.writeText(cmd).then(() => {
+      setToast("📋 APIサーバー未起動のためコマンドをコピーしました");
+    });
+    setCheckCmd({ project: projectName, month: artMonthFilter, cmd });
+  };
+
+  const pollCheckStatus = (projectName, jobId) => {
+    const poll = async () => {
+      try {
+        const res = await fetch(`${CHECK_API}/api/job/${jobId}`);
+        const job = await res.json();
+        if (job.status === "done") {
+          setCheckingJobs((prev) => { const n = { ...prev }; delete n[projectName]; return n; });
+          reloadCheckResults();
+          setToast(`✅ ${projectName} のチェック完了！`);
+          return;
+        }
+        if (job.status === "running") {
+          setCheckingJobs((prev) => ({
+            ...prev,
+            [projectName]: {
+              jobId, status: "running",
+              progress: job.progress || 0, total: job.total || 1,
+              step: job.current_step || "",
+              article: job.current_article || "",
+            },
+          }));
+          setTimeout(poll, 5000); // Poll every 5s
+        }
+      } catch {
+        // Server disconnected - keep showing last status
+        setTimeout(poll, 15000);
+      }
+    };
+    setTimeout(poll, 3000); // First poll after 3s
+  };
+
   const copyCheckCommand = (projectName) => {
     const cmd = `cd ~/Downloads/seo-agent-project/seo-checker && python agent.py --month ${artMonthFilter} --project "${projectName}"`;
     navigator.clipboard.writeText(cmd).then(() => {
@@ -405,6 +945,7 @@ export default function TaskManagementView() {
             { id: "list", label: "📋 一覧" },
             { id: "inprog", label: "🔄 進行中", badge: inprogress.filter((t) => !t.done).length },
             { id: "deleg", label: "👥 依頼", badge: pendingDelegCount },
+            { id: "monthly", label: "📆 月次", badge: recurring.length },
             { id: "articles", label: "📝 コンテンツSEO", badge: articles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length },
           ].map((t) => (
             <button key={t.id} onClick={() => setTmTab(t.id)} style={{
@@ -430,15 +971,50 @@ export default function TaskManagementView() {
           <Btn variant="ghost" onClick={nextDay} style={{ fontSize: 16, padding: "4px 8px" }}>→</Btn>
           {date !== todayKey() && <Btn variant="secondary" onClick={() => setDate(todayKey())} style={{ fontSize: 11 }}>今日</Btn>}
           <div style={{ flex: 1 }} />
-          {/* Quick timer */}
-          <button onClick={qtToggle} style={{
-            padding: "4px 12px", borderRadius: T.radiusSm, fontSize: 11, fontWeight: 600, cursor: "pointer",
-            background: qtRunning ? T.warning + "22" : "transparent", color: qtRunning ? T.warning : T.textMuted,
-            border: `1px solid ${qtRunning ? T.warning + "44" : T.border}`, fontFamily: T.font,
-          }}>
-            {qtRunning ? `💬 ${fmtSec(qtStartedAt ? Math.floor((Date.now() - qtStartedAt) / 1000) : 0)}` : "💬 雑務"}
-          </button>
+          <button onClick={() => {
+            const td = date;
+            const allItems = [];
+            (projects || []).forEach((p) => {
+              (p.tasks || []).forEach((t) => {
+                if (!t.done && t.deadline && dl(t.deadline) === td) {
+                  allItems.push({ text: t.text, pname: p.name, deadline: dl(t.deadline) });
+                }
+              });
+            });
+            visibleDayTasks.filter((t) => !t.done).forEach((t) => {
+              allItems.push({ text: t.name, pname: t.project || "", deadline: td });
+            });
+            const byDate = {};
+            const dateOrder = [];
+            allItems.forEach((t) => {
+              const d = t.deadline || td;
+              if (!byDate[d]) { byDate[d] = []; dateOrder.push(d); }
+              byDate[d].push(t);
+            });
+            dateOrder.sort();
+            const lines = ["＃タスク一覧（" + td.slice(5, 10).replace("-", "/") + "）"];
+            dateOrder.forEach((d) => {
+              lines.push("");
+              lines.push("▼" + d.slice(5, 10).replace("-", "/"));
+              byDate[d].forEach((t) => {
+                lines.push("・" + t.text + (t.pname ? " [" + t.pname + "]" : ""));
+              });
+            });
+            setExportText(lines.join("\n"));
+          }} style={{ padding: "3px 10px", borderRadius: 4, border: `1px solid ${T.border}`, background: "transparent", color: T.textMuted, fontSize: 9, cursor: "pointer", fontFamily: T.font }}>📤 エクスポート</button>
         </div>
+
+        {/* Export panel */}
+        {exportText && <Card style={{ padding: "12px 14px", border: `1px solid ${T.accent}33`, background: T.accent + "05" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontSize: 12, fontWeight: 600, color: T.text }}>📤 エクスポート結果</span>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button onClick={() => { navigator.clipboard.writeText(exportText).then(() => setToast("📋 コピーしました")); }} style={{ padding: "3px 10px", borderRadius: 4, border: `1px solid ${T.accent}44`, background: T.accent + "10", color: T.accent, fontSize: 10, fontWeight: 600, cursor: "pointer", fontFamily: T.font }}>コピー</button>
+              <button onClick={() => setExportText("")} style={{ padding: "3px 8px", borderRadius: 4, border: `1px solid ${T.border}`, background: "transparent", color: T.textMuted, fontSize: 10, cursor: "pointer", fontFamily: T.font }}>✕</button>
+            </div>
+          </div>
+          <textarea readOnly value={exportText} onFocus={(e) => e.target.select()} style={{ width: "100%", minHeight: 200, padding: "10px 12px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font, lineHeight: 1.6, resize: "vertical", boxSizing: "border-box", outline: "none" }} />
+        </Card>}
 
         {/* Stats */}
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -457,11 +1033,99 @@ export default function TaskManagementView() {
           </Card>
         </div>
 
+        {/* ── チャット・雑務 Card (always visible on today) ── */}
+        {date === todayKey() && (
+          <Card style={{ padding: "12px 16px", border: `1px solid ${qtRunning ? T.warning + "66" : T.warning + "22"}`, background: qtRunning ? T.warning + "08" : T.bgCard }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <span style={{ fontSize: 20 }}>💬</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: T.text }}>チャットの返信・雑務</div>
+                <div style={{ fontSize: 11, color: T.textMuted, marginTop: 2 }}>
+                  {qtRunning ? "計測中..." : "▶で開始 → ⏹で停止してタスクに記録"}
+                  {qtTotalSec > 0 && !qtRunning && <span style={{ marginLeft: 8, color: T.warning }}>本日合計: {fmtSec(qtTotalSec)}</span>}
+                </div>
+              </div>
+              <div style={{ fontSize: 24, fontWeight: 700, fontVariantNumeric: "tabular-nums", fontFamily: "'SF Mono','Menlo',monospace", color: qtRunning ? T.warning : T.textMuted, minWidth: 70, textAlign: "right", letterSpacing: 1 }}>
+                {fmtSec(getQtElapsed())}
+              </div>
+              <button onClick={qtToggle} style={{ width: 48, height: 48, borderRadius: "50%", border: `2px solid ${qtRunning ? T.error : T.warning}`, background: qtRunning ? T.error + "15" : T.warning + "15", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0, transition: "all 0.2s" }}>
+                {qtRunning ? "⏹" : "▶"}
+              </button>
+            </div>
+          </Card>
+        )}
+
         {loadingTasks && <div style={{ textAlign: "center", color: T.textMuted, fontSize: 13, padding: 16 }}>読み込み中...</div>}
 
-        {/* Task list */}
+        {/* Overdue tasks banner */}
+        {date === todayKey() && overdueCount > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", borderRadius: T.radiusXs, background: T.warning + "10", border: `1px solid ${T.warning}33` }}>
+            <span style={{ fontSize: 14 }}>⚠️</span>
+            <span style={{ flex: 1, fontSize: 12, color: T.warning, fontWeight: 600 }}>期限切れタスク {overdueCount}件</span>
+            <button onClick={rescheduleOverdueToToday} style={{ padding: "4px 12px", borderRadius: 4, border: `1px solid ${T.warning}55`, background: T.warning + "18", color: T.warning, fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>📅 全て今日に移動</button>
+          </div>
+        )}
+
+        {/* All tasks (project + daily) */}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {dayTasks.map((task) => {
+          {regularProjTasks.filter(t => !t.done).map((t) => {
+              const isOver = t._isOverdue || (t.deadline && dl(t.deadline) < todayKey());
+              const elapsed = getProjElapsed(t);
+              const isRunning = !!(projTimers[t.id] && projTimers[t.id].running);
+              const estSec = t.estimateSec || 0;
+              const pct = estSec > 0 ? Math.min(elapsed / estSec, 1) : 0;
+              const over = elapsed > estSec && estSec > 0;
+              const barColor = t.done ? T.success : over ? T.error : isRunning ? T.accent : T.textMuted;
+              return (
+                <Card key={t.id} style={{ padding: 0, overflow: "hidden", border: `1px solid ${isRunning ? T.accent + "55" : t._isOverdue ? T.warning + "44" : T.border}`, background: isRunning ? T.accent + "06" : t._isOverdue ? T.warning + "04" : T.bgCard }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px" }}>
+                    <button onClick={() => toggleProjDone(t._pid, t.id)} style={{ width: 24, height: 24, borderRadius: "50%", border: `2px solid ${t.done ? T.success : T.border}`, background: t.done ? T.success + "22" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: T.success, flexShrink: 0 }}>
+                      {t.done ? "✓" : ""}
+                    </button>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                        {t._pname && <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: T.accent + "15", color: T.accent }}>{truncate(t._pname, 12)}</span>}
+                        {t._isOverdue && <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 4, background: T.warning + "20", color: T.warning, fontWeight: 700 }}>{t.rescheduledFrom ? "繰越" : "期限切れ"}</span>}
+                        <span style={{ fontSize: 13, fontWeight: 500, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.text}</span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
+                        {renderDeadline(t.id, t.deadline, { prefix: "〆 ", fontSize: 10, overrideColor: isOver ? T.error : T.textMuted, afterSave: (id, iso) => saveProjTaskDeadline(t._pid, id, iso) })}
+                        {t.rescheduledFrom && <span style={{ fontSize: 9, color: T.warning }}>← {t.rescheduledFrom.slice(5).replace("-", "/")}</span>}
+                        <span style={{ fontSize: 10, color: T.textMuted }}>見積: {fmtSec(estSec)}</span>
+                        {t.memo && <span style={{ fontSize: 10, color: T.warning }}>📝</span>}
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "right", flexShrink: 0, minWidth: 70 }}>
+                      <div style={{ fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums", fontFamily: `'SF Mono', monospace`, color: t.done ? T.success : over ? T.error : isRunning ? T.accent : T.text }}>{fmtSec(elapsed)}</div>
+                      {over && !t.done && <div style={{ fontSize: 9, color: T.error }}>+{fmtSec(elapsed - estSec)}</div>}
+                    </div>
+                    {!t.done ? (
+                      <button onClick={() => toggleProjTimer(t._pid, t.id)} style={{ width: 40, height: 40, borderRadius: "50%", border: `2px solid ${isRunning ? T.error : T.success}`, background: isRunning ? T.error + "15" : T.success + "15", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, flexShrink: 0 }}>{isRunning ? "⏸" : "▶"}</button>
+                    ) : (
+                      <button onClick={() => { setProjTimers((prev) => ({ ...prev, [t.id]: { running: false, startedAt: null, elapsed: 0 } })); persistProjElapsed(t._pid, t.id, 0); }} title="リセット" style={{ width: 40, height: 40, borderRadius: "50%", border: `2px solid ${T.border}`, background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, flexShrink: 0, color: T.textMuted }}>↺</button>
+                    )}
+                    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                      <button onClick={() => toggleProjTaskType(t._pid, t.id)} title="進行中に変更" style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.5 }}>🔄</button>
+                      <button onClick={() => setEditingProjTask({ _pid: t._pid, id: t.id, text: t.text, estimateMin: Math.round(estSec / 60) })} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.5 }}>✏️</button>
+                      <button onClick={() => deleteProjTask(t._pid, t.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
+                    </div>
+                  </div>
+                  {editingProjTask?.id === t.id && (
+                    <div style={{ padding: "8px 12px", borderTop: `1px solid ${T.border}`, background: T.bg, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
+                      <input value={editingProjTask.text} onChange={(e) => setEditingProjTask({ ...editingProjTask, text: e.target.value })} style={{ flex: 1, minWidth: 120, padding: "5px 8px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} />
+                      <input type="number" value={editingProjTask.estimateMin} onChange={(e) => setEditingProjTask({ ...editingProjTask, estimateMin: parseInt(e.target.value) || 0 })} style={{ width: 50, padding: "5px 4px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }} />
+                      <span style={{ fontSize: 10, color: T.textMuted }}>分</span>
+                      <Btn onClick={saveProjTaskEdit} style={{ fontSize: 10, padding: "4px 10px" }}>保存</Btn>
+                      <Btn variant="ghost" onClick={() => setEditingProjTask(null)} style={{ fontSize: 10, padding: "4px 8px" }}>✕</Btn>
+                    </div>
+                  )}
+                  <div style={{ height: 3, background: T.border }}>
+                    <div style={{ height: 3, background: barColor, width: `${Math.min(pct * 100, 100)}%`, transition: "width 0.5s", opacity: 0.7 }} />
+                  </div>
+                </Card>
+              );
+            })}
+          {visibleDayTasks.filter(t => !t.done).map((task) => {
             const elapsed = getElapsed(task);
             const pct = task.estimateSec > 0 ? Math.min(elapsed / task.estimateSec, 1) : 0;
             const over = elapsed > task.estimateSec && task.estimateSec > 0;
@@ -479,10 +1143,12 @@ export default function TaskManagementView() {
                   {/* Task info */}
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      {task.status === "inprog_child" && (() => { const tbh = getBallHolder(task.ballHolder); return (<button onClick={async () => { const curIdx = BALL_HOLDERS.findIndex((b) => b.id === (task.ballHolder || "self")); const nextBall = BALL_HOLDERS[(curIdx + 1) % BALL_HOLDERS.length].id; setDayTasks((prev) => prev.map((dt) => dt.id === task.id ? { ...dt, ballHolder: nextBall } : dt)); await updateTaskDB(task.id, { ballHolder: nextBall }); }} style={{ fontSize: 8, padding: "2px 6px", borderRadius: 99, background: tbh.color + "22", color: tbh.color, border: `1px solid ${tbh.color}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600, flexShrink: 0 }}>{tbh.label}</button>); })()}
                       {task.project && <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: T.accent + "15", color: T.accent }}>{truncate(task.project, 12)}</span>}
                       <span style={{ fontSize: 13, fontWeight: 500, color: task.done ? T.textMuted : T.text, textDecoration: task.done ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{task.name}</span>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
+                      {task.deadline && renderDeadline(task.id, task.deadline, { prefix: "〆 ", fontSize: 10, overrideColor: dl(task.deadline) < todayKey() ? T.error : T.textMuted, afterSave: async (id, iso) => { setDayTasks((prev) => prev.map((dt) => dt.id === id ? { ...dt, deadline: iso } : dt)); await updateTaskDB(id, { deadline: iso }); } })}
                       <span style={{ fontSize: 10, color: T.textMuted }}>見積: {fmtSec(task.estimateSec || 0)}</span>
                       {task.memo && <span style={{ fontSize: 10, color: T.warning }}>📝</span>}
                     </div>
@@ -517,7 +1183,11 @@ export default function TaskManagementView() {
                       <option value="">案件なし</option>
                       {projectNames.map((n) => <option key={n} value={n}>{n}</option>)}
                     </select>
+                    <span style={{ fontSize: 10, color: T.textMuted }}>見積</span>
                     <input type="number" value={editingTask.estimateMin} onChange={(e) => setEditingTask({ ...editingTask, estimateMin: parseInt(e.target.value) || 0 })} style={{ width: 50, padding: "5px 4px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }} />
+                    <span style={{ fontSize: 10, color: T.textMuted }}>分</span>
+                    <span style={{ fontSize: 10, color: T.textMuted, marginLeft: 4 }}>実績</span>
+                    <input type="number" value={editingTask.elapsedMin} onChange={(e) => setEditingTask({ ...editingTask, elapsedMin: parseInt(e.target.value) || 0 })} style={{ width: 50, padding: "5px 4px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }} />
                     <span style={{ fontSize: 10, color: T.textMuted }}>分</span>
                     <Btn onClick={saveTaskEdit} style={{ fontSize: 10, padding: "4px 10px" }}>保存</Btn>
                     <Btn variant="ghost" onClick={() => setEditingTask(null)} style={{ fontSize: 10, padding: "4px 8px" }}>✕</Btn>
@@ -544,6 +1214,92 @@ export default function TaskManagementView() {
           })}
         </div>
 
+        {/* ── 完了タスク ── */}
+        {(() => {
+          const doneTasks = visibleDayTasks.filter(t => t.done);
+          const doneProjTasks = regularProjTasks.filter(t => t.done);
+          const totalDone = doneTasks.length + doneProjTasks.length;
+          if (totalDone === 0) return null;
+          return (
+            <div>
+              <button onClick={() => setDoneSectionOpen(!doneSectionOpen)} style={{ width: "100%", display: "flex", alignItems: "center", gap: 6, padding: "8px 4px", background: "none", border: "none", cursor: "pointer", fontFamily: T.font }}>
+                <span style={{ fontSize: 10, color: T.success, transition: "transform 0.2s", transform: doneSectionOpen ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>
+                <span style={{ fontSize: 11, fontWeight: 600, color: T.success }}>✅ 完了タスク（{totalDone}）</span>
+              </button>
+              {doneSectionOpen && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {doneProjTasks.map((t) => {
+                    const elapsed = getProjElapsed(t);
+                    const openProjEdit = () => setEditingProjTask(editingProjTask?.id === t.id ? null : { _pid: t._pid, id: t.id, text: t.text, estimateMin: Math.round((t.estimateSec || 0) / 60), elapsedMin: Math.round(elapsed / 60) });
+                    return (
+                      <Card key={t.id} style={{ padding: 0, overflow: "hidden", opacity: 0.7 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", cursor: "pointer" }} onClick={openProjEdit}>
+                          <button onClick={(e) => { e.stopPropagation(); toggleProjDone(t._pid, t.id); }} style={{ width: 20, height: 20, borderRadius: "50%", border: `2px solid ${T.success}`, background: T.success + "22", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: T.success, flexShrink: 0 }}>✓</button>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <span style={{ fontSize: 12, color: T.textMuted, textDecoration: "line-through" }}>{t.text}</span>
+                            {t._pname && <span style={{ fontSize: 9, color: T.textDim, marginLeft: 6 }}>[{truncate(t._pname, 12)}]</span>}
+                          </div>
+                          <span style={{ fontSize: 14, fontWeight: 600, fontVariantNumeric: "tabular-nums", fontFamily: "'SF Mono', monospace", color: T.success }}>{fmtSec(elapsed)}</span>
+                          <span style={{ fontSize: 11, color: T.textDim }}>✏️</span>
+                        </div>
+                        {editingProjTask?.id === t.id && (
+                          <div style={{ padding: "8px 12px", borderTop: `1px solid ${T.border}`, background: T.bg, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                              <span style={{ fontSize: 10, color: T.textMuted }}>実績</span>
+                              <input type="number" value={editingProjTask.elapsedMin} onChange={(e) => setEditingProjTask({ ...editingProjTask, elapsedMin: parseInt(e.target.value) || 0 })} onClick={(e) => e.stopPropagation()} style={{ width: 50, padding: "5px 4px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }} />
+                              <span style={{ fontSize: 10, color: T.textMuted }}>分</span>
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                              <span style={{ fontSize: 10, color: T.textMuted }}>見積</span>
+                              <input type="number" value={editingProjTask.estimateMin} onChange={(e) => setEditingProjTask({ ...editingProjTask, estimateMin: parseInt(e.target.value) || 0 })} onClick={(e) => e.stopPropagation()} style={{ width: 50, padding: "5px 4px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }} />
+                              <span style={{ fontSize: 10, color: T.textMuted }}>分</span>
+                            </div>
+                            <Btn onClick={(e) => { e.stopPropagation(); setProjTimers((prev) => ({ ...prev, [t.id]: { ...prev[t.id], running: false, elapsed: (editingProjTask.elapsedMin || 0) * 60 } })); saveProjTaskEdit(); }} style={{ fontSize: 10, padding: "4px 10px" }}>保存</Btn>
+                            <Btn variant="ghost" onClick={(e) => { e.stopPropagation(); setEditingProjTask(null); }} style={{ fontSize: 10, padding: "4px 8px" }}>✕</Btn>
+                          </div>
+                        )}
+                      </Card>
+                    );
+                  })}
+                  {doneTasks.map((task) => {
+                    const elapsed = getElapsed(task);
+                    const openEdit = () => setEditingTask(editingTask?.id === task.id ? null : { id: task.id, name: task.name, project: task.project, estimateMin: Math.round((task.estimateSec || 0) / 60), elapsedMin: Math.round(elapsed / 60) });
+                    return (
+                      <Card key={task.id} style={{ padding: 0, overflow: "hidden", opacity: 0.7 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", cursor: "pointer" }} onClick={openEdit}>
+                          <button onClick={(e) => { e.stopPropagation(); markDone(task.id); }} style={{ width: 20, height: 20, borderRadius: "50%", border: `2px solid ${T.success}`, background: T.success + "22", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: T.success, flexShrink: 0 }}>✓</button>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <span style={{ fontSize: 12, color: T.textMuted, textDecoration: "line-through" }}>{task.name}</span>
+                            {task.project && <span style={{ fontSize: 9, color: T.textDim, marginLeft: 6 }}>[{truncate(task.project, 12)}]</span>}
+                          </div>
+                          <span style={{ fontSize: 14, fontWeight: 600, fontVariantNumeric: "tabular-nums", fontFamily: "'SF Mono', monospace", color: T.success }}>{fmtSec(elapsed)}</span>
+                          <span style={{ fontSize: 11, color: T.textDim }}>✏️</span>
+                        </div>
+                        {editingTask?.id === task.id && (
+                          <div style={{ padding: "8px 12px", borderTop: `1px solid ${T.border}`, background: T.bg, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                              <span style={{ fontSize: 10, color: T.textMuted }}>実績</span>
+                              <input type="number" value={editingTask.elapsedMin} onChange={(e) => setEditingTask({ ...editingTask, elapsedMin: parseInt(e.target.value) || 0 })} style={{ width: 50, padding: "5px 4px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }} />
+                              <span style={{ fontSize: 10, color: T.textMuted }}>分</span>
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                              <span style={{ fontSize: 10, color: T.textMuted }}>見積</span>
+                              <input type="number" value={editingTask.estimateMin} onChange={(e) => setEditingTask({ ...editingTask, estimateMin: parseInt(e.target.value) || 0 })} style={{ width: 50, padding: "5px 4px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }} />
+                              <span style={{ fontSize: 10, color: T.textMuted }}>分</span>
+                            </div>
+                            <Btn onClick={saveTaskEdit} style={{ fontSize: 10, padding: "4px 10px" }}>保存</Btn>
+                            <Btn variant="ghost" onClick={() => setEditingTask(null)} style={{ fontSize: 10, padding: "4px 8px" }}>✕</Btn>
+                          </div>
+                        )}
+                      </Card>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
         {/* Add task form */}
         {adding ? (
           <Card style={{ border: `1px solid ${T.accent}33` }}>
@@ -554,7 +1310,7 @@ export default function TaskManagementView() {
             {!bulkMode ? (
               <div style={{ display: "flex", gap: 6, alignItems: "flex-end", flexWrap: "wrap" }}>
                 <div style={{ flex: 1, minWidth: 160 }}>
-                  <input value={newName} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addTask(); }} autoFocus placeholder="タスク名..." style={{ width: "100%", padding: "7px 10px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font, boxSizing: "border-box" }} />
+                  <input value={newName} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) addTask(); }} autoFocus placeholder="タスク名..." style={{ width: "100%", padding: "7px 10px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font, boxSizing: "border-box" }} />
                 </div>
                 <select value={newProject} onChange={(e) => setNewProject(e.target.value)} style={{ padding: "7px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }}>
                   <option value="">案件</option>
@@ -587,98 +1343,423 @@ export default function TaskManagementView() {
         ) : (
           <Btn variant="secondary" onClick={() => setAdding(true)} style={{ alignSelf: "flex-start" }}>+ タスクを追加</Btn>
         )}
+
+        {/* ── 進行中タスク（inprogress + 案件タスク を統合）── */}
+        {(() => {
+          const todayInprog = inprogress.filter(t => !t.done);
+          const visibleProjTasks = inprogProjTasks;
+          const totalCount = todayInprog.length + visibleProjTasks.length;
+          if (totalCount === 0) return null;
+          return (
+            <div style={{ marginTop: 4 }}>
+              <button onClick={() => setInprogSectionOpen(!inprogSectionOpen)} style={{ width: "100%", display: "flex", alignItems: "center", gap: 6, padding: "8px 4px", background: "none", border: "none", cursor: "pointer", fontFamily: T.font }}>
+                <span style={{ fontSize: 10, color: T.cyan, transition: "transform 0.2s", transform: inprogSectionOpen ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>
+                <span style={{ fontSize: 11, fontWeight: 600, color: T.cyan }}>🔄 進行中タスク（{totalCount}）</span>
+              </button>
+              {inprogSectionOpen && <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {/* 案件タスク（projects state） */}
+                {visibleProjTasks.map(t => {
+                  const bh = getBallHolder(t.ballHolder);
+                  const isSelf = (t.ballHolder || "self") === "self";
+                  const isOver = t.deadline && dl(t.deadline) < todayKey();
+                  return (
+                    <Card key={"proj-" + t.id} style={{ padding: 0, overflow: "hidden", border: `1px solid ${isSelf ? T.accent + "44" : bh.color + "22"}`, background: isSelf ? T.accent + "06" : T.bgCard }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px" }}>
+                        <button onClick={() => cycleProjBallHolder(t._pid, t.id)} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 99, background: bh.color + "22", color: bh.color, border: `1px solid ${bh.color}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600, flexShrink: 0 }}>{bh.label}</button>
+                        {t._pname && <button onClick={() => onNavigateToClient && onNavigateToClient(t._pname)} style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: T.cyan + "20", color: T.cyan, border: `1px solid ${T.cyan}33`, cursor: "pointer", fontFamily: T.font, flexShrink: 0 }}>{truncate(t._pname, 12)}</button>}
+                        <span style={{ flex: 1, fontSize: 13, fontWeight: 500, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.text}</span>
+                        {renderDeadline(t.id, t.deadline, { prefix: "", fontSize: 10, overrideColor: isOver ? T.error : T.textMuted, afterSave: (id, iso) => saveProjTaskDeadline(t._pid, id, iso) })}
+                        <button onClick={() => toggleProjTaskType(t._pid, t.id)} title="通常タスクに変更" style={{ fontSize: 10, padding: "2px 5px", background: "none", border: `1px solid ${T.border}`, borderRadius: 4, color: T.textDim, cursor: "pointer", fontFamily: T.font, flexShrink: 0 }}>📋</button>
+                        <button onClick={() => { setAddingFromInprog(addingFromInprog === "proj-" + t.id ? null : "proj-" + t.id); setFromInprogName(""); }} title="自分タスクを追加" style={{ width: 24, height: 24, borderRadius: "50%", border: `1px solid ${T.accent}44`, background: addingFromInprog === "proj-" + t.id ? T.accent + "22" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: T.accent, flexShrink: 0 }}>+</button>
+                      </div>
+                      {addingFromInprog === "proj-" + t.id && (
+                        <div style={{ padding: "6px 12px 10px", borderTop: `1px solid ${T.border}22`, display: "flex", gap: 6, alignItems: "center" }}>
+                          <input value={fromInprogName} onChange={(e) => setFromInprogName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { addTaskFromInprog({ project: t._pname, name: t.text }); } }} autoFocus placeholder="自分タスク名..." style={{ flex: 1, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font, outline: "none" }} />
+                          <Btn onClick={() => addTaskFromInprog({ project: t._pname, name: t.text })} disabled={!fromInprogName.trim()} style={{ fontSize: 10, padding: "4px 10px" }}>追加</Btn>
+                        </div>
+                      )}
+                    </Card>
+                  );
+                })}
+                {/* 進行中タスク（tasks table） */}
+                {todayInprog.map(t => {
+                  const bh = getBallHolder(t.ballHolder);
+                  const isSelf = t.ballHolder === "self";
+                  return (
+                    <Card key={t.id} style={{ padding: 0, overflow: "hidden", border: `1px solid ${isSelf ? T.accent + "44" : bh.color + "22"}`, background: isSelf ? T.accent + "06" : T.bgCard }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px" }}>
+                        <button onClick={() => updateInprogBall(t.id, BALL_HOLDERS[(BALL_HOLDERS.findIndex((b) => b.id === t.ballHolder) + 1) % BALL_HOLDERS.length].id)} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 99, background: bh.color + "22", color: bh.color, border: `1px solid ${bh.color}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600, flexShrink: 0 }}>{bh.label}</button>
+                        {t.project && <button onClick={() => onNavigateToClient && onNavigateToClient(t.project)} style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: T.cyan + "20", color: T.cyan, border: `1px solid ${T.cyan}33`, cursor: "pointer", fontFamily: T.font, flexShrink: 0 }}>{truncate(t.project, 12)}</button>}
+                        <span style={{ flex: 1, fontSize: 13, fontWeight: 500, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</span>
+                        {renderDeadline(t.id, t.deadline, { prefix: "", fontSize: 10, overrideColor: dl(t.deadline) < todayKey() ? T.error : T.textMuted, afterSave: async (id, iso) => { setInprogress((prev) => prev.map((x) => x.id === id ? { ...x, deadline: iso } : x)); await updateTaskDB(id, { deadline: iso }); } })}
+                        <button onClick={() => { setAddingFromInprog(addingFromInprog === t.id ? null : t.id); setFromInprogName(""); }} title="自分タスクを追加" style={{ width: 24, height: 24, borderRadius: "50%", border: `1px solid ${T.accent}44`, background: addingFromInprog === t.id ? T.accent + "22" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: T.accent, flexShrink: 0 }}>+</button>
+                      </div>
+                      {addingFromInprog === t.id && (
+                        <div style={{ padding: "6px 12px 10px", borderTop: `1px solid ${T.border}22`, display: "flex", gap: 6, alignItems: "center" }}>
+                          <input value={fromInprogName} onChange={(e) => setFromInprogName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) addTaskFromInprog(t); }} autoFocus placeholder="自分タスク名..." style={{ flex: 1, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font, outline: "none" }} />
+                          <Btn onClick={() => addTaskFromInprog(t)} disabled={!fromInprogName.trim()} style={{ fontSize: 10, padding: "4px 10px" }}>追加</Btn>
+                        </div>
+                      )}
+                    </Card>
+                  );
+                })}
+              </div>}
+            </div>
+          );
+        })()}
+
+        {/* ── 依頼リマインド ── */}
+        {(() => {
+          const today = todayKey();
+          const reminders = delegations.filter(d => !d.done && d.status !== "done" && d.deadline && dl(d.deadline) <= today);
+          if (reminders.length === 0) return null;
+          return (
+            <div style={{ marginTop: 4 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: T.warning, padding: "6px 0", display: "flex", alignItems: "center", gap: 6 }}>
+                <span>⏰</span> 依頼リマインド（{reminders.length}）
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {reminders.map(r => (
+                  <Card key={r.id} style={{ padding: "8px 12px", border: `1px solid ${T.warning}22`, background: T.warning + "06" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <button onClick={() => cycleDelegStatus(r.id)} style={{ fontSize: 8, padding: "2px 6px", borderRadius: 99, background: delegStatusColor(r.status) + "22", color: delegStatusColor(r.status), border: `1px solid ${delegStatusColor(r.status)}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600, whiteSpace: "nowrap" }}>{delegStatusLabel(r.status)}</button>
+                      {r.project && <span style={{ fontSize: 9, color: T.textMuted }}>{truncate(r.project, 12)}</span>}
+                      <span style={{ flex: 1, fontSize: 13, color: T.text }}>{r.name}</span>
+                      {r.assignee && <span style={{ fontSize: 9, color: T.purple }}>→ {r.assignee}</span>}
+                      <span style={{ fontSize: 9, color: T.error }}>{dlDisplay(r.deadline)}</span>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
       </>}
 
-      {/* ═══ LIST TAB ═══ */}
-      {tmTab === "list" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div style={{ fontSize: 13, color: T.textDim }}>全タスク一覧（今日のタスク + 委任 + 進行中）</div>
+      {/* ═══ LIST TAB (Unified Task List - matches original) ═══ */}
+      {tmTab === "list" && (() => {
+        const today = todayKey();
+        // Aggregate ALL tasks from all sources
+        const allTasks = [];
+        // 1. Project/client tasks
+        (projects || []).forEach((p) => {
+          const pcc = (CAT_COLORS[(p.services || [p.category])[0]] || CAT_COLORS["SEO"]);
+          (p.tasks || []).forEach((t) => {
+            allTasks.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color, _src: "project" });
+          });
+        });
+        // 2. Daily tasks (from tasks table, not already linked to projects)
+        allActiveTasks.forEach((t) => {
+          // Skip if already represented by a project task (via linkId or same name+project)
+          if (t.linkId && allTasks.some((at) => at.linkId === t.linkId)) return;
+          if (t.name && t.project && allTasks.some((at) => at.text === t.name && at._pname === t.project)) return;
+          const projMatch = (projects || []).find((p) => p.name === t.project);
+          const pcc = projMatch ? (CAT_COLORS[(projMatch.services || [projMatch.category])[0]] || CAT_COLORS["SEO"]).color : T.accent;
+          allTasks.push({ id: t.id, text: t.name, done: t.done || false, deadline: t.deadline || "", _pid: "__daily", _pname: t.project || "日次タスク", _pcc: pcc, _src: "daily" });
+        });
+        const open = allTasks.filter((t) => !t.done);
+        const overdue = open.filter((t) => dl(t.deadline) && dl(t.deadline) < today).sort((a, b) => dl(a.deadline) > dl(b.deadline) ? 1 : -1);
+        const todayItems = open.filter((t) => dl(t.deadline) && dl(t.deadline) === today);
+        const upcoming = open.filter((t) => dl(t.deadline) && dl(t.deadline) > today).sort((a, b) => dl(a.deadline) > dl(b.deadline) ? 1 : -1);
+        const noDl = open.filter((t) => !dl(t.deadline));
 
-          {/* Daily tasks summary */}
-          <Card>
-            <div style={{ fontSize: 12, fontWeight: 600, color: T.text, marginBottom: 8 }}>📅 {dateLabel(date)} のタスク ({dayTasks.length}件)</div>
-            {dayTasks.map((t) => (
-              <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", borderBottom: `1px solid ${T.borderSubtle}` }}>
-                <span style={{ fontSize: 12, color: t.done ? T.success : T.textMuted }}>{t.done ? "✅" : "⬜"}</span>
-                {t.project && <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: T.accent + "15", color: T.accent }}>{truncate(t.project, 10)}</span>}
-                <span style={{ fontSize: 12, color: t.done ? T.textMuted : T.text, textDecoration: t.done ? "line-through" : "none" }}>{t.name}</span>
+        const toggleListTask = async (t) => {
+          if (t._src === "project") {
+            await toggleProjDone(t._pid, t.id);
+          } else if (t._src === "daily") {
+            await updateTaskDB(t.id, { done: true, completedAt: new Date().toISOString() });
+            if (t.linkId) syncTaskStatus(t.linkId, true);
+            loadAllActive();
+            loadDayTasks();
+          }
+        };
+
+        const renderTaskRow = (t) => {
+          const isOver = dl(t.deadline) && dl(t.deadline) < today;
+          const isToday = dl(t.deadline) && dl(t.deadline) === today;
+          const bh = BALL_HOLDERS.find((b) => b.id === t._ball);
+          return (
+            <div key={t.id + t._pid + (t._src || "")} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: `1px solid ${T.border}22` }}>
+              <button onClick={() => toggleListTask(t)} style={{ width: 20, height: 20, borderRadius: "50%", border: `2px solid ${t.done ? T.success : t._pcc}`, background: t.done ? T.success + "22" : "transparent", cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: T.success }}>{t.done ? "✓" : ""}</button>
+              {t._src === "daily" && <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 4, background: T.accent + "18", color: T.accent, fontWeight: 600, flexShrink: 0 }}>日次</span>}
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: t._pcc, flexShrink: 0 }} />
+              <button onClick={() => onNavigateToClient && onNavigateToClient(t._pname)} style={{ color: T.cyan, fontSize: 12, flexShrink: 0, maxWidth: 100, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", background: "none", border: `1px solid ${T.cyan}33`, borderRadius: 4, padding: "1px 6px", cursor: "pointer", fontFamily: T.font }}>{t._pname}</button>
+              {bh && <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 99, background: bh.color + "12", color: bh.color, fontWeight: 600, flexShrink: 0 }}>{bh.label}</span>}
+              <span style={{ flex: 1, fontSize: 14, color: t.done ? T.textDim : T.text, textDecoration: t.done ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.text}</span>
+              {renderDeadline(t.id, t.deadline, { prefix: "", fontSize: 11, overrideColor: isOver ? T.error : isToday ? T.warning : T.textDim, afterSave: async (id, iso) => {
+                if (t._src === "project") { await saveProjTaskDeadline(t._pid, id, iso); }
+                else { await updateTaskDB(id, { deadline: iso }); }
+                loadAllActive(); loadSpecialTasks();
+              } })}
+            </div>
+          );
+        };
+
+        const renderSection = (label, items, color) => {
+          if (items.length === 0) return null;
+          return (
+            <div key={label}>
+              <div style={{ fontSize: 13, fontWeight: 600, color, padding: "8px 10px", background: color + "08", borderRadius: T.radiusXs, marginBottom: 2 }}>{label}（{items.length}）</div>
+              {items.map(renderTaskRow)}
+            </div>
+          );
+        };
+
+        // Pagination
+        const allItems = [...overdue, ...todayItems, ...upcoming, ...noDl];
+        const totalPages = Math.ceil(allItems.length / LIST_PAGE_SIZE);
+        const pagedOverdue = overdue.slice(listPage * LIST_PAGE_SIZE, (listPage + 1) * LIST_PAGE_SIZE);
+        // Calculate remaining slots after overdue items on this page
+        let remaining = LIST_PAGE_SIZE - pagedOverdue.length;
+        let offset = Math.max(0, listPage * LIST_PAGE_SIZE - overdue.length);
+        const pagedToday = remaining > 0 ? todayItems.slice(offset, offset + remaining) : [];
+        remaining -= pagedToday.length;
+        offset = Math.max(0, listPage * LIST_PAGE_SIZE - overdue.length - todayItems.length);
+        const pagedUpcoming = remaining > 0 ? upcoming.slice(offset, offset + remaining) : [];
+        remaining -= pagedUpcoming.length;
+        offset = Math.max(0, listPage * LIST_PAGE_SIZE - overdue.length - todayItems.length - upcoming.length);
+        const pagedNoDl = remaining > 0 ? noDl.slice(offset, offset + remaining) : [];
+
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ fontSize: 15, fontWeight: 600, color: T.text }}>全保持タスク一覧（未完了 {open.length}件）</div>
+              <Btn variant="ghost" onClick={loadAllActive} style={{ fontSize: 11, padding: "4px 10px" }}>🔄</Btn>
+            </div>
+
+            <Card style={{ padding: "8px 0" }}>
+              {renderSection("🔴 期限超過", pagedOverdue, T.error)}
+              {renderSection("🟡 今日", pagedToday, T.warning)}
+              {renderSection("📅 今後", pagedUpcoming, T.accent)}
+              {renderSection("📋 期限なし", pagedNoDl, T.textMuted)}
+              {open.length === 0 && <div style={{ fontSize: 13, color: T.textMuted, textAlign: "center", padding: 16 }}>未完了タスクなし</div>}
+            </Card>
+
+            {/* Pagination */}
+            {totalPages > 1 && (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                <button onClick={() => setListPage((p) => Math.max(0, p - 1))} disabled={listPage === 0} style={{ padding: "6px 12px", fontSize: 13, background: listPage === 0 ? "transparent" : T.bgCard, border: `1px solid ${T.border}`, borderRadius: 6, color: listPage === 0 ? T.textDim : T.text, cursor: listPage === 0 ? "default" : "pointer", fontFamily: T.font }}>←</button>
+                <span style={{ fontSize: 13, color: T.textMuted }}>{listPage + 1} / {totalPages}</span>
+                <button onClick={() => setListPage((p) => Math.min(totalPages - 1, p + 1))} disabled={listPage >= totalPages - 1} style={{ padding: "6px 12px", fontSize: 13, background: listPage >= totalPages - 1 ? "transparent" : T.bgCard, border: `1px solid ${T.border}`, borderRadius: 6, color: listPage >= totalPages - 1 ? T.textDim : T.text, cursor: listPage >= totalPages - 1 ? "default" : "pointer", fontFamily: T.font }}>→</button>
               </div>
-            ))}
-            {dayTasks.length === 0 && <div style={{ fontSize: 11, color: T.textMuted }}>タスクなし</div>}
-          </Card>
+            )}
 
-          {/* Delegations summary */}
-          <Card>
-            <div style={{ fontSize: 12, fontWeight: 600, color: T.text, marginBottom: 8 }}>👥 委任タスク ({delegations.length}件)</div>
-            {delegations.slice(0, 10).map((d) => (
-              <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", borderBottom: `1px solid ${T.borderSubtle}` }}>
-                <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: delegStatusColor(d.status) + "22", color: delegStatusColor(d.status) }}>{delegStatusLabel(d.status)}</span>
-                {d.project && <span style={{ fontSize: 9, color: T.textMuted }}>[{truncate(d.project, 10)}]</span>}
-                <span style={{ fontSize: 12, color: T.text }}>{d.name}</span>
-                {d.assignee && <span style={{ fontSize: 9, color: T.purple }}>→ {d.assignee}</span>}
-              </div>
-            ))}
-          </Card>
-
-          {/* In-progress summary */}
-          <Card>
-            <div style={{ fontSize: 12, fontWeight: 600, color: T.text, marginBottom: 8 }}>🔄 進行中タスク ({inprogress.length}件)</div>
-            {inprogress.slice(0, 10).map((t) => {
-              const bh = getBallHolder(t.ballHolder);
-              return (
-                <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", borderBottom: `1px solid ${T.borderSubtle}` }}>
-                  <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: bh.color + "22", color: bh.color }}>{bh.label}</span>
-                  {t.project && <span style={{ fontSize: 9, color: T.textMuted }}>[{truncate(t.project, 10)}]</span>}
-                  <span style={{ fontSize: 12, color: t.done ? T.textMuted : T.text }}>{t.name}</span>
+            {/* ── 月次定期タスク ── */}
+            <Card style={{ padding: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 15, fontWeight: 700, color: T.text }}>🔄 月次定期タスク</span>
+                  <span style={{ fontSize: 11, padding: "2px 10px", borderRadius: 99, background: T.accent + "18", color: T.accent, fontWeight: 600 }}>{recurring.length}</span>
                 </div>
+                <button onClick={() => setAddingMonthly(true)} style={{ padding: "4px 12px", borderRadius: 6, border: `1px solid ${T.border}`, background: T.bgCard, color: T.text, fontSize: 11, cursor: "pointer", fontFamily: T.font }}>+ 追加</button>
+              </div>
+              <div style={{ padding: "0 14px 10px", display: "flex", flexDirection: "column", gap: 4 }}>
+                {recurring.map((r) => (
+                  <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", background: T.bg, borderRadius: T.radiusXs }}>
+                    <span style={{ fontSize: 13 }}>🔁</span>
+                    <span style={{ fontSize: 14, fontWeight: 500, color: T.text, flex: 1 }}>{r.name}</span>
+                    {r.project && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: T.cyan + "15", color: T.cyan, border: `1px solid ${T.cyan}33` }}>{truncate(r.project, 15)}</span>}
+                    <span style={{ fontSize: 12, color: T.textMuted }}>毎月{r.dayOfMonth}日</span>
+                    <button onClick={() => setEditingMonthly({ ...r })} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: T.textDim }}>✏️</button>
+                    <button onClick={() => removeRecurring(r.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
+                  </div>
+                ))}
+                {addingMonthly && (
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end", padding: "8px 0" }}>
+                    <input value={monthlyName} onChange={(e) => setMonthlyName(e.target.value)} autoFocus placeholder="タスク名..." style={{ flex: 1, minWidth: 140, padding: "6px 8px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 13, fontFamily: T.font }} />
+                    <select value={monthlyProject} onChange={(e) => setMonthlyProject(e.target.value)} style={{ padding: "6px 6px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }}>
+                      <option value="">案件なし</option>
+                      {projectNames.map((n) => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                    <select value={monthlyDay} onChange={(e) => setMonthlyDay(Number(e.target.value))} style={{ padding: "6px 6px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }}>
+                      {Array.from({ length: 31 }, (_, i) => <option key={i + 1} value={i + 1}>{i + 1}日</option>)}
+                    </select>
+                    <Btn onClick={() => { if (monthlyName.trim()) { saveRecurring({ name: monthlyName.trim(), project: monthlyProject || null, dayOfMonth: monthlyDay }); setMonthlyName(""); setMonthlyProject(""); setMonthlyDay(1); setAddingMonthly(false); } }} disabled={!monthlyName.trim()}>追加</Btn>
+                    <Btn variant="ghost" onClick={() => setAddingMonthly(false)}>✕</Btn>
+                  </div>
+                )}
+              </div>
+              <div style={{ padding: "0 14px 10px", fontSize: 10, color: T.textMuted }}>※ 毎月指定日に自動でタスクに追加されます</div>
+            </Card>
+
+            {/* ── 進行中タスク サマリー ── */}
+            {(() => {
+              const activeInprog = inprogress.filter((t) => !t.done);
+              if (activeInprog.length === 0) return null;
+              const preview = activeInprog.slice(0, 5);
+              const rest = activeInprog.length - preview.length;
+              return (
+                <Card style={{ padding: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 15, fontWeight: 700, color: T.text }}>🔄 進行中タスク</span>
+                      <span style={{ fontSize: 11, padding: "2px 10px", borderRadius: 99, background: T.cyan + "18", color: T.cyan, fontWeight: 600 }}>{activeInprog.length}</span>
+                    </div>
+                    <button onClick={() => setTmTab("inprog")} style={{ padding: "4px 12px", borderRadius: 6, border: `1px solid ${T.border}`, background: T.bgCard, color: T.text, fontSize: 11, cursor: "pointer", fontFamily: T.font }}>詳細 →</button>
+                  </div>
+                  <div style={{ padding: "0 14px 10px", display: "flex", flexDirection: "column", gap: 2 }}>
+                    {preview.map((t) => {
+                      const bh = getBallHolder(t.ballHolder);
+                      const subs = t.subtasks || [];
+                      const subDone = subs.filter((s) => s.done).length;
+                      return (
+                        <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: `1px solid ${T.border}11` }}>
+                          <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 99, background: bh.color + "22", color: bh.color, fontWeight: 600, flexShrink: 0 }}>{bh.label}</span>
+                          {t.project && <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: T.cyan + "15", color: T.cyan, flexShrink: 0 }}>{truncate(t.project, 12)}</span>}
+                          <span style={{ flex: 1, fontSize: 13, fontWeight: 500, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</span>
+                          {subs.length > 0 && <span style={{ fontSize: 9, color: T.textMuted }}>{subDone}/{subs.length}</span>}
+                          {t.deadline && <span style={{ fontSize: 10, color: dl(t.deadline) < todayKey() ? T.error : T.textMuted }}>{dl(t.deadline).slice(5, 10).replace("-", "/")}</span>}
+                        </div>
+                      );
+                    })}
+                    {rest > 0 && <div style={{ padding: "6px 0", fontSize: 11, color: T.cyan, cursor: "pointer" }} onClick={() => setTmTab("inprog")}>他 {rest} 件を表示...</div>}
+                  </div>
+                </Card>
               );
-            })}
-          </Card>
-        </div>
-      )}
+            })()}
+
+            {/* ── 依頼中タスク サマリー ── */}
+            {(() => {
+              const activeDel = delegations.filter((d) => !d.done);
+              if (activeDel.length === 0) return null;
+              const preview = activeDel.slice(0, 5);
+              const rest = activeDel.length - preview.length;
+              return (
+                <Card style={{ padding: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 15, fontWeight: 700, color: T.text }}>📮 依頼中タスク</span>
+                      <span style={{ fontSize: 11, padding: "2px 10px", borderRadius: 99, background: T.warning + "18", color: T.warning, fontWeight: 600 }}>{activeDel.length}</span>
+                    </div>
+                    <button onClick={() => setTmTab("deleg")} style={{ padding: "4px 12px", borderRadius: 6, border: `1px solid ${T.border}`, background: T.bgCard, color: T.text, fontSize: 11, cursor: "pointer", fontFamily: T.font }}>詳細 →</button>
+                  </div>
+                  <div style={{ padding: "0 14px 10px", display: "flex", flexDirection: "column", gap: 2 }}>
+                    {preview.map((d) => (
+                      <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: `1px solid ${T.border}11` }}>
+                        <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: delegStatusColor(d.status) + "22", color: delegStatusColor(d.status), fontWeight: 600, flexShrink: 0 }}>{delegStatusLabel(d.status)}</span>
+                        <span style={{ flex: 1, fontSize: 13, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.name}</span>
+                        {d.assignee && <span style={{ fontSize: 10, color: T.purple }}>→ {d.assignee}</span>}
+                        {d.deadline && <span style={{ fontSize: 10, color: dl(d.deadline) < todayKey() ? T.error : T.textMuted }}>{dl(d.deadline).slice(5, 10).replace("-", "/")}</span>}
+                      </div>
+                    ))}
+                    {rest > 0 && <div style={{ padding: "6px 0", fontSize: 11, color: T.warning, cursor: "pointer" }} onClick={() => setTmTab("deleg")}>他 {rest} 件を表示...</div>}
+                  </div>
+                </Card>
+              );
+            })()}
+          </div>
+        );
+      })()}
 
       {/* ═══ IN-PROGRESS TAB ═══ */}
       {tmTab === "inprog" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {inprogress.map((task) => {
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 15, fontWeight: 700, color: T.text }}>🔄 進行中タスク</span>
+              <span style={{ fontSize: 12, color: T.textMuted }}>{inprogress.filter(t => !t.done).length} 件</span>
+            </div>
+            <Btn variant="secondary" onClick={() => setAddingInprog(true)} style={{ fontSize: 11, padding: "4px 12px" }}>+ 追加</Btn>
+          </div>
+          {/* Active tasks */}
+          {inprogress.filter(t => !t.done).map((task) => {
             const bh = getBallHolder(task.ballHolder);
             const subs = task.subtasks || [];
             const subDone = subs.filter((s) => s.done).length;
             return (
-              <Card key={task.id} style={{ border: `1px solid ${task.done ? T.success + "44" : bh.color + "33"}`, opacity: task.done ? 0.6 : 1 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                  <button onClick={() => toggleInprogDone(task.id)} style={{ width: 22, height: 22, borderRadius: "50%", border: `2px solid ${task.done ? T.success : T.border}`, background: task.done ? T.success + "22" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: T.success, flexShrink: 0 }}>{task.done ? "✓" : ""}</button>
-                  <button onClick={() => updateInprogBall(task.id, BALL_HOLDERS[(BALL_HOLDERS.findIndex((b) => b.id === task.ballHolder) + 1) % BALL_HOLDERS.length].id)} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 99, background: bh.color + "22", color: bh.color, border: `1px solid ${bh.color}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600 }}>{bh.label}</button>
-                  {task.project && <span style={{ fontSize: 9, color: T.textMuted }}>[{truncate(task.project, 15)}]</span>}
-                  <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>{task.name}</span>
-                  {subs.length > 0 && <span style={{ fontSize: 9, color: T.textMuted }}>{subDone}/{subs.length}</span>}
-                  {task.deadline && <span style={{ fontSize: 9, color: T.warning }}>〆 {dlDisplay(task.deadline)}</span>}
-                  <button onClick={() => deleteInprogTask(task.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
+              <Card key={task.id} style={{ padding: 0, overflow: "hidden", borderLeft: `3px solid ${bh.color}`, border: `1px solid ${bh.color + "33"}`, borderLeftWidth: 3 }}>
+                <div style={{ padding: "14px 16px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <button onClick={() => toggleInprogDone(task.id)} title="完了（アーカイブ）" style={{ width: 22, height: 22, borderRadius: "50%", border: `2px solid ${T.border}`, background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: T.success, flexShrink: 0 }} />
+                    <button onClick={() => updateInprogBall(task.id, BALL_HOLDERS[(BALL_HOLDERS.findIndex((b) => b.id === task.ballHolder) + 1) % BALL_HOLDERS.length].id)} style={{ fontSize: 10, padding: "3px 10px", borderRadius: 99, background: bh.color + "22", color: bh.color, border: `1px solid ${bh.color}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600 }}>{bh.label}</button>
+                    {task.project && <button onClick={() => onNavigateToClient && onNavigateToClient(task.project)} style={{ fontSize: 10, color: T.cyan, background: "none", border: `1px solid ${T.cyan}33`, borderRadius: 4, padding: "2px 8px", cursor: "pointer", fontFamily: T.font, fontWeight: 500 }}>{truncate(task.project, 15)}</button>}
+                    <span style={{ fontSize: 15, fontWeight: 600, color: T.text, flex: 1 }}>{task.name}</span>
+                    {subs.length > 0 && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: T.bgCard, color: T.textMuted, fontWeight: 600 }}>{subDone}/{subs.length}</span>}
+                    <button onClick={() => setEditingTask(editingTask?.id === task.id ? null : { id: task.id, name: task.name, project: task.project || "", ballHolder: task.ballHolder || "self", deadline: task.deadline || "", memo: task.memo || "", _isInprog: true })} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: T.textDim }}>✏️</button>
+                    <button onClick={() => deleteInprogTask(task.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
+                  </div>
+                  {task.deadline && <div style={{ fontSize: 11, color: dl(task.deadline) < todayKey() ? T.error : T.textMuted, marginBottom: 4, fontWeight: dl(task.deadline) < todayKey() ? 600 : 400 }}>{dl(task.deadline) < todayKey() ? "⚠ " : ""}期限: {dl(task.deadline).slice(5, 10).replace("-", "/")}</div>}
+                  {task.memo && <div style={{ fontSize: 11, color: T.textDim, marginBottom: 4 }}>📝 {task.memo}</div>}
+
+                  {/* Edit panel */}
+                  {editingTask?.id === task.id && editingTask._isInprog && (
+                    <div style={{ padding: "8px 0", borderTop: `1px solid ${T.border}`, marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
+                      <input value={editingTask.name} onChange={(e) => setEditingTask({ ...editingTask, name: e.target.value })} style={{ flex: 1, minWidth: 140, padding: "5px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} />
+                      <select value={editingTask.project} onChange={(e) => setEditingTask({ ...editingTask, project: e.target.value })} style={{ padding: "5px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }}>
+                        <option value="">案件なし</option>
+                        {projectNames.map((n) => <option key={n} value={n}>{n}</option>)}
+                      </select>
+                      <select value={editingTask.ballHolder} onChange={(e) => setEditingTask({ ...editingTask, ballHolder: e.target.value })} style={{ padding: "5px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }}>
+                        {BALL_HOLDERS.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
+                      </select>
+                      <input type="date" value={editingTask.deadline} onChange={(e) => setEditingTask({ ...editingTask, deadline: e.target.value })} style={{ padding: "4px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }} />
+                      <input value={editingTask.memo} onChange={(e) => setEditingTask({ ...editingTask, memo: e.target.value })} placeholder="メモ" style={{ flex: 1, minWidth: 100, padding: "5px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }} />
+                      <Btn onClick={async () => { await updateTaskDB(task.id, { name: editingTask.name, project: editingTask.project || null, ballHolder: editingTask.ballHolder, deadline: editingTask.deadline || null, memo: editingTask.memo || null }); setInprogress((prev) => prev.map((t) => t.id === task.id ? { ...t, name: editingTask.name, project: editingTask.project || null, ballHolder: editingTask.ballHolder, deadline: editingTask.deadline || null, memo: editingTask.memo || null } : t)); setEditingTask(null); setToast("✅ 更新しました"); }} style={{ fontSize: 10, padding: "4px 10px" }}>保存</Btn>
+                      <Btn variant="ghost" onClick={() => setEditingTask(null)} style={{ fontSize: 10, padding: "4px 8px" }}>✕</Btn>
+                    </div>
+                  )}
                 </div>
+
                 {/* Subtasks */}
-                {subs.length > 0 && (
-                  <div style={{ marginLeft: 30, borderLeft: `2px solid ${T.border}`, paddingLeft: 10 }}>
-                    {subs.map((sub, si) => (
-                      <div key={si} style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 0" }}>
-                        <input type="checkbox" checked={sub.done} onChange={() => {
-                          const newSubs = [...subs]; newSubs[si] = { ...sub, done: !sub.done };
-                          setInprogress((prev) => prev.map((t) => (t.id === task.id ? { ...t, subtasks: newSubs } : t)));
-                          updateTaskDB(task.id, { subtasks: newSubs });
-                        }} style={{ cursor: "pointer" }} />
-                        <span style={{ fontSize: 11, color: sub.done ? T.textMuted : T.text, textDecoration: sub.done ? "line-through" : "none" }}>{sub.text || sub.name}</span>
-                      </div>
-                    ))}
+                {(subs.length > 0 || true) && (
+                  <div style={{ borderTop: `1px solid ${T.border}33`, padding: "8px 16px 10px" }}>
+                    {subs.length > 0 && <div style={{ fontSize: 10, color: T.textMuted, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>サブタスク <span style={{ fontWeight: 600 }}>{subDone}/{subs.length}</span></div>}
+                    {subs.map((sub, si) => {
+                      const sbh = getBallHolder(sub.ballHolder);
+                      return (
+                        <div key={si} style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 0", borderBottom: `1px solid ${T.border}11` }}>
+                          <input type="checkbox" checked={sub.done} onChange={() => {
+                            const newSubs = [...subs]; newSubs[si] = { ...sub, done: !sub.done };
+                            setInprogress((prev) => prev.map((t) => (t.id === task.id ? { ...t, subtasks: newSubs } : t)));
+                            updateTaskDB(task.id, { subtasks: newSubs });
+                          }} style={{ cursor: "pointer", width: 16, height: 16 }} />
+                          <button onClick={() => { const newSubs = [...subs]; const curIdx = BALL_HOLDERS.findIndex((b) => b.id === (sub.ballHolder || "self")); newSubs[si] = { ...sub, ballHolder: BALL_HOLDERS[(curIdx + 1) % BALL_HOLDERS.length].id }; setInprogress((prev) => prev.map((t) => (t.id === task.id ? { ...t, subtasks: newSubs } : t))); updateTaskDB(task.id, { subtasks: newSubs }); }} style={{ fontSize: 8, padding: "1px 5px", borderRadius: 99, background: sbh.color + "22", color: sbh.color, border: `1px solid ${sbh.color}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600, flexShrink: 0 }}>{sbh.label}</button>
+                          <span style={{ fontSize: 12, color: sub.done ? T.textMuted : T.text, textDecoration: sub.done ? "line-through" : "none", flex: 1 }}>{sub.text || sub.name}</span>
+                          {sub.deadline && <span style={{ fontSize: 9, color: T.textMuted }}>📅{dl(sub.deadline).slice(5, 10).replace("-", "/")}</span>}
+                          <button onClick={() => { const newSubs = subs.filter((_, i) => i !== si); setInprogress((prev) => prev.map((t) => (t.id === task.id ? { ...t, subtasks: newSubs } : t))); updateTaskDB(task.id, { subtasks: newSubs }); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>✕</button>
+                        </div>
+                      );
+                    })}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+                      <input placeholder="サブタスクを追加..." onKeyDown={(e) => { if (e.key === "Enter" && e.target.value.trim()) { const newSubs = [...subs, { text: e.target.value.trim(), done: false, ballHolder: "self" }]; setInprogress((prev) => prev.map((t) => (t.id === task.id ? { ...t, subtasks: newSubs } : t))); updateTaskDB(task.id, { subtasks: newSubs }); e.target.value = ""; } }} style={{ flex: 1, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font, outline: "none" }} />
+                      <button onClick={(e) => { const input = e.target.parentElement.querySelector("input"); if (input && input.value.trim()) { const newSubs = [...subs, { text: input.value.trim(), done: false, ballHolder: "self" }]; setInprogress((prev) => prev.map((t) => (t.id === task.id ? { ...t, subtasks: newSubs } : t))); updateTaskDB(task.id, { subtasks: newSubs }); input.value = ""; } }} style={{ width: 28, height: 28, borderRadius: 6, border: `1px solid ${T.border}`, background: T.bgCard, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: T.textMuted }}>+</button>
+                      <button onClick={() => deleteInprogTask(task.id)} style={{ width: 28, height: 28, borderRadius: 6, border: `1px solid ${T.border}`, background: T.bgCard, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: T.textDim }}>🗑</button>
+                    </div>
                   </div>
                 )}
               </Card>
             );
           })}
 
-          {/* Add in-progress */}
-          {addingInprog ? (
+          {/* Archived (completed) tasks */}
+          {(() => {
+            const archived = inprogress.filter(t => t.done);
+            if (archived.length === 0) return null;
+            return (
+              <div style={{ marginTop: 8 }}>
+                <button onClick={() => setShowArchive(v => !v)} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: T.textMuted, background: "none", border: "none", cursor: "pointer", fontFamily: T.font, padding: "4px 0" }}>
+                  <span style={{ transform: showArchive ? "rotate(90deg)" : "none", transition: "transform 0.15s", fontSize: 10 }}>▶</span>
+                  完了済み（{archived.length}）
+                </button>
+                {showArchive && archived.map((task) => (
+                  <Card key={task.id} style={{ padding: "6px 12px", marginTop: 4, opacity: 0.5, border: `1px solid ${T.success}22` }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <button onClick={() => toggleInprogDone(task.id)} title="復元" style={{ width: 20, height: 20, borderRadius: "50%", border: `2px solid ${T.success}`, background: T.success + "22", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: T.success, flexShrink: 0 }}>✓</button>
+                      {task.project && <span style={{ fontSize: 9, color: T.textMuted }}>{truncate(task.project, 12)}</span>}
+                      <span style={{ fontSize: 12, color: T.textDim, textDecoration: "line-through", flex: 1 }}>{task.name}</span>
+                      <button onClick={() => deleteInprogTask(task.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+            );
+          })()}
+
+          {/* Add in-progress form */}
+          {addingInprog && (
             <Card style={{ border: `1px solid ${T.cyan}33` }}>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
-                <input value={ipName} onChange={(e) => setIpName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addInprogTask(); }} autoFocus placeholder="タスク名..." style={{ flex: 1, minWidth: 140, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} />
+                <input value={ipName} onChange={(e) => setIpName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) addInprogTask(); }} autoFocus placeholder="タスク名..." style={{ flex: 1, minWidth: 140, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} />
                 <select value={ipProject} onChange={(e) => setIpProject(e.target.value)} style={{ padding: "6px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }}>
                   <option value="">案件</option>
                   {projectNames.map((n) => <option key={n} value={n}>{n}</option>)}
@@ -690,8 +1771,6 @@ export default function TaskManagementView() {
                 <Btn variant="ghost" onClick={() => setAddingInprog(false)}>✕</Btn>
               </div>
             </Card>
-          ) : (
-            <Btn variant="secondary" onClick={() => setAddingInprog(true)} style={{ alignSelf: "flex-start" }}>+ 進行中タスクを追加</Btn>
           )}
         </div>
       )}
@@ -706,7 +1785,7 @@ export default function TaskManagementView() {
                 {d.project && <span style={{ fontSize: 9, color: T.textMuted }}>[{truncate(d.project, 12)}]</span>}
                 <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>{d.name}</span>
                 {d.assignee && <span style={{ fontSize: 10, color: T.purple }}>→ {d.assignee}</span>}
-                {d.deadline && <span style={{ fontSize: 9, color: T.warning }}>〆 {dlDisplay(d.deadline)}</span>}
+                {renderDeadline(d.id, d.deadline, { afterSave: async (id, iso) => { setDelegations((prev) => prev.map((t) => t.id === id ? { ...t, deadline: iso } : t)); await updateTaskDB(id, { deadline: iso }); } })}
                 <button onClick={() => deleteDelegTask(d.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
               </div>
               {d.memo && <div style={{ marginTop: 4, fontSize: 11, color: T.textDim, paddingLeft: 8 }}>📝 {d.memo}</div>}
@@ -717,7 +1796,7 @@ export default function TaskManagementView() {
           {addingDeleg ? (
             <Card style={{ border: `1px solid ${T.purple}33` }}>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
-                <input value={delegName} onChange={(e) => setDelegName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addDelegTask(); }} autoFocus placeholder="依頼内容..." style={{ flex: 1, minWidth: 140, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} />
+                <input value={delegName} onChange={(e) => setDelegName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) addDelegTask(); }} autoFocus placeholder="依頼内容..." style={{ flex: 1, minWidth: 140, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} />
                 <select value={delegProject} onChange={(e) => setDelegProject(e.target.value)} style={{ padding: "6px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }}>
                   <option value="">案件</option>
                   {projectNames.map((n) => <option key={n} value={n}>{n}</option>)}
@@ -730,7 +1809,66 @@ export default function TaskManagementView() {
               <textarea value={delegMemo} onChange={(e) => setDelegMemo(e.target.value)} placeholder="メモ（任意）" rows={2} style={{ width: "100%", marginTop: 6, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font, resize: "vertical", boxSizing: "border-box" }} />
             </Card>
           ) : (
-            <Btn variant="secondary" onClick={() => setAddingDeleg(true)} style={{ alignSelf: "flex-start" }}>+ 委任タスクを追加</Btn>
+            <Btn variant="secondary" onClick={() => setAddingDeleg(true)} style={{ alignSelf: "flex-start" }}>+ 依頼タスクを追加</Btn>
+          )}
+        </div>
+      )}
+
+      {/* ═══ MONTHLY TAB (月次定期タスク) ═══ */}
+      {tmTab === "monthly" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ fontSize: 13, color: T.textDim }}>毎月◯日に自動追加されるタスク（{recurring.length}件）</div>
+
+          {recurring.map((r) => {
+            const isEditing = editingMonthly && editingMonthly.id === r.id;
+            return (
+              <Card key={r.id} style={{ border: `1px solid ${T.border}44` }}>
+                {isEditing ? (
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
+                    <input value={editingMonthly.name} onChange={(e) => setEditingMonthly({ ...editingMonthly, name: e.target.value })} style={{ flex: 1, minWidth: 140, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 13, fontFamily: T.font }} />
+                    <select value={editingMonthly.project || ""} onChange={(e) => setEditingMonthly({ ...editingMonthly, project: e.target.value })} style={{ padding: "6px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }}>
+                      <option value="">案件なし</option>
+                      {projectNames.map((n) => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                    <select value={editingMonthly.dayOfMonth} onChange={(e) => setEditingMonthly({ ...editingMonthly, dayOfMonth: Number(e.target.value) })} style={{ padding: "6px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }}>
+                      {Array.from({ length: 31 }, (_, i) => <option key={i + 1} value={i + 1}>{i + 1}日</option>)}
+                    </select>
+                    <Btn onClick={async () => { await saveRecurring(editingMonthly); setEditingMonthly(null); }}>保存</Btn>
+                    <Btn variant="ghost" onClick={() => setEditingMonthly(null)}>✕</Btn>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: T.accent + "18", color: T.accent, fontWeight: 600, flexShrink: 0 }}>毎月{r.dayOfMonth}日</span>
+                    {r.project && <button onClick={() => onNavigateToClient && onNavigateToClient(r.project)} style={{ fontSize: 10, color: T.cyan, background: "none", border: `1px solid ${T.cyan}33`, borderRadius: 4, padding: "1px 6px", cursor: "pointer", fontFamily: T.font }}>{truncate(r.project, 12)}</button>}
+                    <span style={{ fontSize: 14, fontWeight: 500, color: T.text, flex: 1 }}>{r.name}</span>
+                    <button onClick={() => setEditingMonthly({ ...r })} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: T.textDim }}>✏️</button>
+                    <button onClick={() => removeRecurring(r.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+
+          {recurring.length === 0 && <div style={{ fontSize: 13, color: T.textMuted, textAlign: "center", padding: 20 }}>定期タスクなし</div>}
+
+          {/* Add monthly recurring task */}
+          {addingMonthly ? (
+            <Card style={{ border: `1px solid ${T.accent}33` }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
+                <input value={monthlyName} onChange={(e) => setMonthlyName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && monthlyName.trim()) { saveRecurring({ name: monthlyName.trim(), project: monthlyProject || null, dayOfMonth: monthlyDay }); setMonthlyName(""); setMonthlyProject(""); setMonthlyDay(1); setAddingMonthly(false); } }} autoFocus placeholder="タスク名..." style={{ flex: 1, minWidth: 140, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 13, fontFamily: T.font }} />
+                <select value={monthlyProject} onChange={(e) => setMonthlyProject(e.target.value)} style={{ padding: "6px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }}>
+                  <option value="">案件なし</option>
+                  {projectNames.map((n) => <option key={n} value={n}>{n}</option>)}
+                </select>
+                <select value={monthlyDay} onChange={(e) => setMonthlyDay(Number(e.target.value))} style={{ padding: "6px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }}>
+                  {Array.from({ length: 31 }, (_, i) => <option key={i + 1} value={i + 1}>{i + 1}日</option>)}
+                </select>
+                <Btn onClick={() => { if (monthlyName.trim()) { saveRecurring({ name: monthlyName.trim(), project: monthlyProject || null, dayOfMonth: monthlyDay }); setMonthlyName(""); setMonthlyProject(""); setMonthlyDay(1); setAddingMonthly(false); } }} disabled={!monthlyName.trim()}>追加</Btn>
+                <Btn variant="ghost" onClick={() => setAddingMonthly(false)}>✕</Btn>
+              </div>
+            </Card>
+          ) : (
+            <Btn variant="secondary" onClick={() => setAddingMonthly(true)} style={{ alignSelf: "flex-start" }}>+ 月次タスクを追加</Btn>
           )}
         </div>
       )}
@@ -814,10 +1952,34 @@ export default function TaskManagementView() {
                       {cr.finalcheckVerdict === "GO" ? "🟢GO" : "🔴NO GO"} {cr.factcheckCritical > 0 ? `🔴${cr.factcheckCritical}` : ""}{cr.factcheckWarning > 0 ? ` 🟡${cr.factcheckWarning}` : ""}
                     </span>
                   )}
-                  {/* Check button (only for writing_review) */}
-                  {isWritingReview && (
-                    <button onClick={() => copyCheckCommand(art.project || art.name)} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "#7C3AED15", color: "#7C3AED", border: `1px solid #7C3AED33`, cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>🔍 チェック</button>
-                  )}
+                  {/* Check button / running status */}
+                  {(() => {
+                    const pName = art.project || art.name;
+                    const job = checkingJobs[pName];
+                    if (job) {
+                      // Show running animation
+                      const pct = job.total > 0 ? Math.round((job.progress / job.total) * 100) : 0;
+                      return (
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <div style={{ position: "relative", width: 60, height: 6, background: T.border, borderRadius: 3, overflow: "hidden" }}>
+                            <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${pct}%`, background: "#7C3AED", borderRadius: 3, transition: "width 0.5s" }} />
+                            <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: "30%", background: "linear-gradient(90deg, transparent, rgba(124,58,237,0.4), transparent)", borderRadius: 3, animation: "shimmer 1.5s infinite" }} />
+                          </div>
+                          <span style={{ fontSize: 8, color: "#7C3AED", fontWeight: 600, whiteSpace: "nowrap", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {job.step || "準備中..."}
+                          </span>
+                          <span style={{ fontSize: 8, color: T.textMuted }}>{job.progress}/{job.total}</span>
+                          <style>{`@keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }`}</style>
+                        </div>
+                      );
+                    }
+                    if (isWritingReview) {
+                      return (
+                        <button onClick={() => startArticleCheck(pName)} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "#7C3AED15", color: "#7C3AED", border: `1px solid #7C3AED33`, cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>🔍 チェック</button>
+                      );
+                    }
+                    return null;
+                  })()}
                   {/* Progress dots: green=done, red/blue=current, gray=future */}
                   <div style={{ display: "flex", gap: 3 }}>
                     {ART_STEPS.map((s, i) => (
@@ -828,7 +1990,7 @@ export default function TaskManagementView() {
                       }} />
                     ))}
                   </div>
-                  {art.deadline && <span style={{ fontSize: 9, color: T.warning }}>〆 {dlDisplay(art.deadline)}</span>}
+                  {renderDeadline(art.id, art.deadline, { afterSave: async (id, iso) => { setArticles((prev) => prev.map((a) => a.id === id ? { ...a, deadline: iso } : a)); await updateTaskDB(id, { deadline: iso }); } })}
                   {/* Add to today's tasks (only if self-waiting) */}
                   {isSelf && (
                     <button onClick={async () => {
@@ -961,22 +2123,52 @@ export default function TaskManagementView() {
             </Card>
           )}
 
-          {/* ── Check Command Modal ── */}
+          {/* ── Check Command Modal (fallback when API server not running) ── */}
           {checkCmd && (
-            <Card style={{ border: `2px solid #7C3AED44`, background: "#7C3AED08" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: T.text, marginBottom: 8 }}>🔍 記事チェック実行</div>
-              <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 6 }}>以下のコマンドをターミナルで実行してください（クリップボードにコピー済み）:</div>
-              <div style={{ padding: "8px 10px", background: T.bg, borderRadius: T.radiusXs, border: `1px solid ${T.border}`, fontFamily: "monospace", fontSize: 10, color: T.text, wordBreak: "break-all", marginBottom: 8 }}>
-                {checkCmd.cmd}
+            <Card style={{ border: `2px solid #F59E0B44`, background: "#F59E0B08" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: T.warning, marginBottom: 8 }}>⚠️ APIサーバー未起動</div>
+              <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 6 }}>
+                ボタンからの自動チェックにはAPIサーバーが必要です。ターミナルで以下を実行してください:
               </div>
-              <div style={{ fontSize: 10, color: T.textDim, marginBottom: 8 }}>
-                オプション: <code style={{ background: T.bgCard, padding: "1px 4px", borderRadius: 2 }}>--dry-run</code> で対象確認 / <code style={{ background: T.bgCard, padding: "1px 4px", borderRadius: 2 }}>--check-type factcheck</code> でファクトチェックのみ
+              <div style={{ padding: "8px 10px", background: T.bg, borderRadius: T.radiusXs, border: `1px solid ${T.border}`, fontFamily: "monospace", fontSize: 10, color: "#7C3AED", wordBreak: "break-all", marginBottom: 6 }}>
+                cd ~/Downloads/seo-agent-project/seo-checker && .venv/bin/python server.py
+              </div>
+              <div style={{ fontSize: 10, color: T.textDim, marginBottom: 6 }}>
+                サーバー起動後は🔍チェックボタンを押すだけで自動実行されます
+              </div>
+              <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8, marginTop: 4 }}>
+                <div style={{ fontSize: 10, color: T.textMuted, marginBottom: 4 }}>手動実行する場合（コピー済み）:</div>
+                <div style={{ padding: "6px 10px", background: T.bg, borderRadius: T.radiusXs, border: `1px solid ${T.border}`, fontFamily: "monospace", fontSize: 9, color: T.textDim, wordBreak: "break-all", marginBottom: 6 }}>
+                  {checkCmd.cmd}
+                </div>
               </div>
               <div style={{ display: "flex", gap: 6 }}>
-                <button onClick={() => { navigator.clipboard.writeText(checkCmd.cmd); setToast("📋 コピーしました"); }} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 4, background: "#7C3AED", color: "#fff", border: "none", cursor: "pointer", fontFamily: T.font }}>📋 再コピー</button>
+                <button onClick={() => { navigator.clipboard.writeText("cd ~/Downloads/seo-agent-project/seo-checker && .venv/bin/python server.py"); setToast("📋 サーバー起動コマンドをコピーしました"); }} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 4, background: "#7C3AED", color: "#fff", border: "none", cursor: "pointer", fontFamily: T.font }}>📋 サーバー起動コマンドをコピー</button>
                 <button onClick={() => setCheckCmd(null)} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 4, background: "none", border: `1px solid ${T.border}`, color: T.textMuted, cursor: "pointer", fontFamily: T.font }}>閉じる</button>
-                <button onClick={() => { reloadCheckResults(); setToast("🔄 結果を更新しました"); }} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 4, background: "none", border: `1px solid ${T.border}`, color: T.textMuted, cursor: "pointer", fontFamily: T.font }}>🔄 結果を確認</button>
               </div>
+            </Card>
+          )}
+
+          {/* ── Running jobs summary ── */}
+          {Object.keys(checkingJobs).length > 0 && (
+            <Card style={{ border: `2px solid #7C3AED44`, background: "#7C3AED06" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: "#7C3AED", marginBottom: 8 }}>🔍 チェック実行中</div>
+              {Object.entries(checkingJobs).map(([pName, job]) => (
+                <div key={pName} style={{ marginBottom: 6 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: T.text }}>{pName}</span>
+                    <span style={{ fontSize: 10, color: T.textMuted }}>{job.progress}/{job.total}件</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ flex: 1, height: 4, background: T.border, borderRadius: 2, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${job.total > 0 ? (job.progress / job.total) * 100 : 0}%`, background: "#7C3AED", borderRadius: 2, transition: "width 0.5s" }} />
+                    </div>
+                    <span style={{ fontSize: 9, color: "#7C3AED", whiteSpace: "nowrap" }}>
+                      {job.article ? `${job.article} - ` : ""}{job.step || "準備中..."}
+                    </span>
+                  </div>
+                </div>
+              ))}
             </Card>
           )}
 
