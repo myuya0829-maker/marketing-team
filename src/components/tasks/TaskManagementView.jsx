@@ -337,7 +337,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
   // ── Daily Task CRUD ──
   const addTask = async () => {
     if (!newName.trim()) return;
-    const task = { name: newName.trim(), estimateSec: newEst * 60, project: newProject || null, taskType: "daily" };
+    const task = { name: newName.trim(), estimateSec: newEst * 60, project: newProject || null, taskType: "daily", deadline: date + "T00:00:00" };
     await insertTaskDB(date, task);
     await loadDayTasks();
     setNewName(""); setNewEst(30); setNewProject(""); setAdding(false);
@@ -347,7 +347,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
     const lines = bulkText.split("\n").map((l) => l.replace(/^[\s\-\*•\d.)\]]+/, "").trim()).filter(Boolean);
     if (lines.length === 0) return;
     for (const line of lines) {
-      await insertTaskDB(date, { name: line, estimateSec: newEst * 60, project: newProject || null, taskType: "daily" });
+      await insertTaskDB(date, { name: line, estimateSec: newEst * 60, project: newProject || null, taskType: "daily", deadline: date + "T00:00:00" });
     }
     await loadDayTasks();
     setBulkText(""); setBulkMode(false); setAdding(false);
@@ -644,7 +644,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
       if (elapsed > 60) {
         const num = qtCount + 1;
         setQtCount(num);
-        await insertTaskDB(date, { name: `💬 ${num} チャット・雑務`, estimateSec: elapsed, elapsedSec: elapsed, done: true, taskType: "daily" });
+        await insertTaskDB(date, { name: `💬 ${num} チャット・雑務`, estimateSec: elapsed, elapsedSec: elapsed, done: true, taskType: "daily", deadline: date + "T00:00:00", completedAt: new Date().toISOString() });
         await loadDayTasks();
       }
     } else {
@@ -780,6 +780,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
       estimateSec: 1800,
       taskType: "daily",
       status: "inprog_child",
+      deadline: date + "T00:00:00",
     });
     await loadDayTasks();
     setFromInprogName("");
@@ -2001,7 +2002,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
                   {/* Add to today's tasks (only if self-waiting) */}
                   {isSelf && (
                     <button onClick={async () => {
-                      await insertTaskDB(todayKey(), { name: `${curStep.label}：${art.project}`, project: art.project, estimateSec: 1800 });
+                      await insertTaskDB(todayKey(), { name: `${curStep.label}：${art.project}`, project: art.project, estimateSec: 1800, deadline: todayKey() + "T00:00:00" });
                       setToast(`📋 今日のタスクに追加: ${curStep.label}：${art.project}`);
                     }} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: T.warning + "15", color: T.warning, border: "none", cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>📋 今日</button>
                   )}
