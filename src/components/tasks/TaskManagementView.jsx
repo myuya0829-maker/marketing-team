@@ -309,6 +309,9 @@ export default function TaskManagementView({ onNavigateToClient }) {
   const extraProjTasks = useMemo(() => todayProjTasks.filter(t => !t.linkId || !dayTaskLinkIds.has(t.linkId)), [todayProjTasks, dayTaskLinkIds]);
   // Split project tasks: regular (default) vs inprog (taskType === "inprogress")
   const regularProjTasks = useMemo(() => extraProjTasks.filter(t => t.taskType !== "inprogress"), [extraProjTasks]);
+  // Past date: count undone tasks that can be moved to today
+  const undoneOnPastDate = useMemo(() => date < todayKey() ? regularProjTasks.filter(t => !t.done).length : 0, [regularProjTasks, date]);
+  // Today: count tasks that carried over (for badge display)
   const overdueCount = useMemo(() => regularProjTasks.filter(t => t._isOverdue && !t.done).length, [regularProjTasks]);
   // In-progress project tasks: always show all (not filtered by date)
   const inprogProjTasks = useMemo(() => {
@@ -454,19 +457,22 @@ export default function TaskManagementView({ onNavigateToClient }) {
     if (updatedProj) await upsertProject(updatedProj);
   };
 
-  // Helper: reschedule all overdue project tasks to today
-  const rescheduleOverdueToToday = async () => {
+  // Helper: reschedule undone tasks from the currently viewed (past) date to today
+  const rescheduleToToday = async () => {
     const today = todayKey();
+    if (date >= today) return; // only works on past dates
     const todayISO = today + "T00:00:00";
     let updatedProjects = [...(projects || [])];
     const affectedProjIds = new Set();
+    let movedCount = 0;
     updatedProjects = updatedProjects.map((p) => {
       let changed = false;
       const newTasks = (p.tasks || []).map((t) => {
         if (!t.deadline || t.done || t.taskType === "inprogress") return t;
         const d = dl(t.deadline);
-        if (d < today) {
+        if (d === date) {
           changed = true;
+          movedCount++;
           return { ...t, deadline: todayISO, rescheduledFrom: t.rescheduledFrom || d };
         }
         return t;
@@ -483,7 +489,8 @@ export default function TaskManagementView({ onNavigateToClient }) {
       const proj = updatedProjects.find((p) => p.id === pid);
       if (proj) await upsertProject(proj);
     }
-    setToast(`📅 ${overdueCount}件のタスクを今日に移動しました`);
+    setToast(`📅 ${movedCount}件のタスクを今日に移動しました`);
+    setDate(today); // 移動後、今日のビューに切り替え
   };
 
   // Helper: toggle project task type between regular and inprogress
@@ -1057,12 +1064,12 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
         {loadingTasks && <div style={{ textAlign: "center", color: T.textMuted, fontSize: 13, padding: 16 }}>読み込み中...</div>}
 
-        {/* Overdue tasks banner */}
-        {date === todayKey() && overdueCount > 0 && (
+        {/* Past date: move undone tasks to today */}
+        {undoneOnPastDate > 0 && (
           <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", borderRadius: T.radiusXs, background: T.warning + "10", border: `1px solid ${T.warning}33` }}>
             <span style={{ fontSize: 14 }}>⚠️</span>
-            <span style={{ flex: 1, fontSize: 12, color: T.warning, fontWeight: 600 }}>期限切れタスク {overdueCount}件</span>
-            <button onClick={rescheduleOverdueToToday} style={{ padding: "4px 12px", borderRadius: 4, border: `1px solid ${T.warning}55`, background: T.warning + "18", color: T.warning, fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>📅 全て今日に移動</button>
+            <span style={{ flex: 1, fontSize: 12, color: T.warning, fontWeight: 600 }}>未完了タスク {undoneOnPastDate}件</span>
+            <button onClick={rescheduleToToday} style={{ padding: "4px 12px", borderRadius: 4, border: `1px solid ${T.warning}55`, background: T.warning + "18", color: T.warning, fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>📅 今日に移動</button>
           </div>
         )}
 
