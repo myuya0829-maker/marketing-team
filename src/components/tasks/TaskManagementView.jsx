@@ -1686,7 +1686,13 @@ export default function TaskManagementView({ onNavigateToClient }) {
                     <button onClick={() => setEditingTask(editingTask?.id === task.id ? null : { id: task.id, name: task.name, project: task.project || "", ballHolder: task.ballHolder || "self", deadline: task.deadline ? task.deadline.slice(5, 10).replace(/-/g, "/") : "", memo: task.memo || "", _isInprog: true })} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: T.textDim }}>✏️</button>
                     <button onClick={() => deleteInprogTask(task.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
                   </div>
-                  {task.deadline && <div style={{ fontSize: 11, color: dl(task.deadline) < todayKey() ? T.error : T.textMuted, marginBottom: 4, fontWeight: dl(task.deadline) < todayKey() ? 600 : 400 }}>{dl(task.deadline) < todayKey() ? "⚠ " : ""}期限: {dl(task.deadline).slice(5, 10).replace("-", "/")}</div>}
+                  <div style={{ fontSize: 11, marginBottom: 4, display: "flex", alignItems: "center", gap: 4 }}>
+                    {editDL?.id === `inprog-${task.id}` ? (
+                      <><span style={{ color: T.textMuted }}>期限:</span><input autoFocus value={editDL.val} onChange={(e) => setEditDL({ ...editDL, val: fmtDateInput(e.target.value) })} onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") setEditDL(null); }} onBlur={async () => { const iso = editDL.val ? toISO(editDL.val) : null; setInprogress((prev) => prev.map((t) => t.id === task.id ? { ...t, deadline: iso } : t)); await updateTaskDB(task.id, { deadline: iso }); setEditDL(null); }} placeholder="MM/DD" style={{ width: 55, padding: "2px 5px", background: T.bg, border: `1px solid ${T.accent}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font, textAlign: "center", outline: "none" }} /></>
+                    ) : (
+                      <span onClick={() => setEditDL({ id: `inprog-${task.id}`, val: task.deadline ? dl(task.deadline).slice(5, 10).replace(/-/g, "/") : "" })} style={{ color: task.deadline ? (dl(task.deadline) < todayKey() ? T.error : T.textMuted) : T.textDim, cursor: "pointer", fontWeight: task.deadline && dl(task.deadline) < todayKey() ? 600 : 400 }}>{task.deadline ? `${dl(task.deadline) < todayKey() ? "⚠ " : ""}期限: ${dl(task.deadline).slice(5, 10).replace("-", "/")}` : "期限: --/--"}</span>
+                    )}
+                  </div>
                   {task.memo && <div style={{ fontSize: 11, color: T.textDim, marginBottom: 4 }}>📝 {task.memo}</div>}
 
                   {/* Edit panel */}
