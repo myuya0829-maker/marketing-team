@@ -23,13 +23,30 @@ import {
   insertTemplate,
   deleteTemplate as deleteTemplateDb,
   fetchRecurring,
+  upsertRecurring,
+  deleteRecurring as deleteRecurringDb,
   fetchArchived,
   insertArchived,
   fetchSettings,
   upsertSettings,
+  syncProjectTasksToDb,
 } from "../hooks/useStorage";
 
 const AppContext = createContext(null);
+
+// Retry wrapper: retries a fetch function up to maxRetries times with exponential backoff
+const withRetry = async (fn, maxRetries = 3, baseDelay = 1000) => {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt === maxRetries) throw e;
+      const delay = baseDelay * Math.pow(2, attempt);
+      console.warn(`Fetch failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delay}ms...`, e.message);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+};
 
 export function AppProvider({ children }) {
   // Core state (existing)
@@ -39,6 +56,9 @@ export function AppProvider({ children }) {
   const [tasks, setTasks] = useState({}); // { [dateKey]: [...tasks] }
   const [toast, setToast] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [taskRefreshSignal, setTaskRefreshSignal] = useState(0);
+  const bumpTaskRefresh = useCallback(() => setTaskRefreshSignal((v) => v + 1), []);
 
   // v2 state
   const [reports, setReports] = useState([]);
@@ -55,42 +75,61 @@ export function AppProvider({ children }) {
 
   const dataLoaded = useRef(false);
 
-  // ── Initial load ──
-  useEffect(() => {
-    (async () => {
-      try {
-        const [rules, kn, fb, rpts, cl, pj, ms, tpl, arch, rec, settings] = await Promise.all([
-          fetchAgentRules(),
-          fetchKnowledge(),
-          fetchFeedbacks(),
-          fetchReports().catch(() => []),
-          fetchClients().catch(() => []),
-          fetchProjects().catch(() => []),
-          fetchMsgStyles().catch(() => ({})),
-          fetchTemplates().catch(() => []),
-          fetchArchived().catch(() => []),
-          fetchRecurring().catch(() => []),
-          fetchSettings().catch(() => ({ netlifyUrl: "", gasUrl: "" })),
-        ]);
-        setAgentRules(rules);
-        setKnowledge(kn);
-        setFeedbacks(fb);
-        setReports(rpts);
-        setClients(cl);
-        setProjects(pj);
-        setMsgStyles(ms);
-        setTemplates(tpl);
-        setArchivedTasks(arch);
-        setRecurring(rec);
-        setNetlifyUrl(settings.netlifyUrl);
-        setGasUrl(settings.gasUrl);
-      } catch (e) {
-        console.error("Initial load error:", e);
+  // ── Initial load with retry ──
+  const loadAllData = useCallback(async () => {
+    setLoading(true);
+    setLoadError(false);
+    let pj = [];
+    try {
+      const [rules, kn, fb, rpts, cl, projects_, ms, tpl, arch, rec, settings] = await Promise.all([
+        withRetry(fetchAgentRules),
+        withRetry(fetchKnowledge),
+        withRetry(fetchFeedbacks),
+        withRetry(fetchReports).catch(() => []),
+        withRetry(fetchClients).catch(() => []),
+        withRetry(fetchProjects).catch(() => []),
+        withRetry(fetchMsgStyles).catch(() => ({})),
+        withRetry(fetchTemplates).catch(() => []),
+        withRetry(fetchArchived).catch(() => []),
+        withRetry(fetchRecurring).catch(() => []),
+        withRetry(fetchSettings).catch(() => ({ netlifyUrl: "", gasUrl: "" })),
+      ]);
+      pj = projects_;
+      setAgentRules(rules);
+      setKnowledge(kn);
+      setFeedbacks(fb);
+      setReports(rpts);
+      setClients(cl);
+      setProjects(pj);
+      setMsgStyles(ms);
+      setTemplates(tpl);
+      setArchivedTasks(arch);
+      setRecurring(rec);
+      setNetlifyUrl(settings.netlifyUrl);
+      setGasUrl(settings.gasUrl);
+      // Verify critical data loaded (projects should not be empty if user has data)
+      if (pj.length === 0) {
+        // Double-check: retry projects alone once more
+        const retryPj = await withRetry(fetchProjects).catch(() => []);
+        if (retryPj.length > 0) {
+          pj = retryPj;
+          setProjects(retryPj);
+        }
       }
-      setLoading(false);
-      dataLoaded.current = true;
-    })();
+    } catch (e) {
+      console.error("Initial load error:", e);
+      setLoadError(true);
+      setToast("⚠️ データ取得に失敗しました。再読み込みしてください");
+    }
+    setLoading(false);
+    dataLoaded.current = true;
+    // One-time sync: ensure project tasks exist in tasks table
+    if (pj && pj.length > 0) {
+      syncProjectTasksToDb(pj).catch((e) => console.error("Task sync:", e));
+    }
   }, []);
+
+  useEffect(() => { loadAllData(); }, [loadAllData]);
 
   // ── Agent Rules ──
   const saveAgentRules = useCallback(
@@ -262,6 +301,18 @@ export function AppProvider({ children }) {
 
   const clearPendingExec = useCallback(() => setPendingExec(null), []);
 
+  // ── Recurring Tasks ──
+  const saveRecurring = useCallback(async (item) => {
+    await upsertRecurring(item);
+    const fresh = await fetchRecurring();
+    setRecurring(fresh);
+  }, []);
+
+  const removeRecurring = useCallback(async (id) => {
+    await deleteRecurringDb(id);
+    setRecurring((prev) => prev.filter((r) => r.id !== id));
+  }, []);
+
   return (
     <AppContext.Provider
       value={{
@@ -273,6 +324,8 @@ export function AppProvider({ children }) {
         tasks,
         toast,
         loading,
+        loadError,
+        reloadData: loadAllData,
         setToast,
         saveAgentRules,
         addKnowledge,
@@ -290,6 +343,8 @@ export function AppProvider({ children }) {
         templates,
         archivedTasks,
         recurring,
+        saveRecurring,
+        removeRecurring,
         pendingExec,
         bgJobLabel,
         // v2 actions
@@ -307,6 +362,8 @@ export function AppProvider({ children }) {
         handleTaskExecute,
         clearPendingExec,
         setBgJobLabel,
+        taskRefreshSignal,
+        bumpTaskRefresh,
         // direct setters for bulk operations (settings import, etc.)
         setKnowledge,
         setFeedbacks,

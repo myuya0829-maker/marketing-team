@@ -49,7 +49,7 @@ const BALL_HOLDERS = [
 ];
 
 export default function TaskManagementView({ onNavigateToClient }) {
-  const { projects, saveProjects, syncTaskStatus, handleTaskExecute, setToast, recurring, saveRecurring, removeRecurring } = useApp();
+  const { projects, saveProjects, syncTaskStatus, handleTaskExecute, setToast, recurring, saveRecurring, removeRecurring, taskRefreshSignal } = useApp();
 
   const [tmTab, setTmTab] = useState("today");
   const [date, setDate] = useState(todayKey());
@@ -242,6 +242,14 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
   useEffect(() => { loadDayTasks(); }, [loadDayTasks]);
   useEffect(() => { loadSpecialTasks(); }, [loadSpecialTasks]);
+
+  // Refresh when FAB or other external component adds a task
+  useEffect(() => {
+    if (taskRefreshSignal > 0) {
+      loadDayTasks();
+      loadSpecialTasks();
+    }
+  }, [taskRefreshSignal, loadDayTasks, loadSpecialTasks]);
 
   // Auto-insert recurring tasks for the current date
   const recurringInserted = useRef(new Set());
