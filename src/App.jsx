@@ -1,10 +1,10 @@
 import { AppProvider } from "./contexts/AppContext";
-import MarketingTeamAI from "./components/layout/App";
+import Stack from "./components/layout/App";
 
 export default function App() {
   return (
     <AppProvider>
-      <MarketingTeamAI />
+      <Stack />
     </AppProvider>
   );
 }

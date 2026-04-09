@@ -28,3 +28,11 @@ dist-ssr
 *.sln
 *.sw?
 .vercel
+.netlify/
+supabase/.temp/
+
+# Legacy pre-pivot snapshots (kept locally for reference)
+legacy/
+
+# Local maintenance scripts (contain hardcoded Supabase URL/keys)
+scripts/

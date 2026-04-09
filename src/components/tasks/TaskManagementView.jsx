@@ -7,12 +7,13 @@ import {
   fetchTasksByDate,
   fetchTasksForDateView,
   fetchAllActiveTasks,
+  fetchAllActiveTasksUnified,
+  fetchClientTasksForDate,
+  fetchCompletedTasksForMonth,
   fetchTasksByType,
   insertTask as insertTaskDB,
   updateTask as updateTaskDB,
   deleteTask as deleteTaskDB,
-  fetchCheckResults,
-  upsertProject,
   updateTaskByLinkId,
   autoInsertRecurringTasks,
 } from "../../hooks/useStorage";
@@ -48,8 +49,14 @@ const BALL_HOLDERS = [
   { id: "designer", label: "デザイナー", color: "#F472B6" },
 ];
 
+// (doneProjTaskIds localStorage removed — tasks table is now the source of truth)
+
 export default function TaskManagementView({ onNavigateToClient }) {
-  const { projects, saveProjects, syncTaskStatus, handleTaskExecute, setToast, recurring, saveRecurring, removeRecurring, taskRefreshSignal } = useApp();
+  const { projects, syncTaskStatus, setToast, recurring, saveRecurring, removeRecurring, taskRefreshSignal } = useApp();
+
+  // (projectsRef / saveProjectsSafe removed — tasks table is now the source of truth)
+
+  // (localStorage doneIds cleanup removed — tasks table is source of truth)
 
   const [tmTab, setTmTab] = useState("today");
   const [date, setDate] = useState(todayKey());
@@ -87,10 +94,6 @@ export default function TaskManagementView({ onNavigateToClient }) {
   // Article state
   const [artMonthFilter, setArtMonthFilter] = useState(curMonth());
   const [expandedArt, setExpandedArt] = useState(null);
-  const [checkResults, setCheckResults] = useState([]);
-  const [checkCmd, setCheckCmd] = useState(null); // {project, month} for command modal
-  const [expandedResult, setExpandedResult] = useState(null);
-  const [checkingJobs, setCheckingJobs] = useState({}); // projectName -> {jobId, status, progress, total, step, article}
 
   // Monthly recurring form
   const [addingMonthly, setAddingMonthly] = useState(false);
@@ -129,6 +132,11 @@ export default function TaskManagementView({ onNavigateToClient }) {
   const [allActiveTasks, setAllActiveTasks] = useState([]);
   const [listPage, setListPage] = useState(0);
   const LIST_PAGE_SIZE = 20;
+
+  // Completed tasks tab
+  const [completedTasks, setCompletedTasks] = useState([]);
+  const [completedMonth, setCompletedMonth] = useState(curMonth());
+  const [loadingCompleted, setLoadingCompleted] = useState(false);
 
   // Project task timers (restored from localStorage)
   const [projTimers, setProjTimers] = useState(() => {
@@ -170,24 +178,18 @@ export default function TaskManagementView({ onNavigateToClient }) {
     });
   }, [projects]);
 
-  // Auto-save running project timers to Supabase every 60 seconds
+  // Auto-save running project timers to tasks table every 60 seconds
   useEffect(() => {
     const interval = setInterval(() => {
       for (const [taskId, pt] of Object.entries(projTimers)) {
         if (pt.running && pt.startedAt) {
           const elapsed = (pt.elapsed || 0) + Math.floor((Date.now() - pt.startedAt) / 1000);
-          const proj = (projects || []).find(p => (p.tasks || []).some(t => t.id === taskId));
-          if (proj) {
-            const updatedTasks = (proj.tasks || []).map(t =>
-              t.id === taskId ? { ...t, elapsedSec: elapsed } : t
-            );
-            upsertProject({ ...proj, tasks: updatedTasks });
-          }
+          updateTaskDB(taskId, { elapsedSec: elapsed });
         }
       }
     }, 60000);
     return () => clearInterval(interval);
-  }, [projTimers, projects]);
+  }, [projTimers]);
 
   // Save timer state when tab becomes hidden (sleep, screen lock, switch tabs)
   useEffect(() => {
@@ -196,20 +198,14 @@ export default function TaskManagementView({ onNavigateToClient }) {
         for (const [taskId, pt] of Object.entries(projTimers)) {
           if (pt.running && pt.startedAt) {
             const elapsed = (pt.elapsed || 0) + Math.floor((Date.now() - pt.startedAt) / 1000);
-            const proj = (projects || []).find(p => (p.tasks || []).some(t => t.id === taskId));
-            if (proj) {
-              const updatedTasks = (proj.tasks || []).map(t =>
-                t.id === taskId ? { ...t, elapsedSec: elapsed } : t
-              );
-              upsertProject({ ...proj, tasks: updatedTasks });
-            }
+            updateTaskDB(taskId, { elapsedSec: elapsed });
           }
         }
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, [projTimers, projects]);
+  }, [projTimers]);
 
   // ── Data loading ──
   const loadDayTasks = useCallback(async () => {
@@ -221,7 +217,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
   }, [date]);
 
   const loadAllActive = useCallback(async () => {
-    const tasks = await fetchAllActiveTasks();
+    const tasks = await fetchAllActiveTasksUnified();
     setAllActiveTasks(tasks);
   }, []);
 
@@ -263,12 +259,16 @@ export default function TaskManagementView({ onNavigateToClient }) {
   }, [date, recurring, loadDayTasks]);
   useEffect(() => { if (tmTab === "list") loadAllActive(); }, [tmTab, loadAllActive]);
 
-  // Load check results when article month changes
+  // Load completed tasks when tab or month changes
   useEffect(() => {
-    if (tmTab === "articles") {
-      fetchCheckResults(null, artMonthFilter).then(setCheckResults).catch(() => setCheckResults([]));
+    if (tmTab === "completed") {
+      setLoadingCompleted(true);
+      fetchCompletedTasksForMonth(completedMonth).then((data) => {
+        setCompletedTasks(data);
+        setLoadingCompleted(false);
+      }).catch(() => { setCompletedTasks([]); setLoadingCompleted(false); });
     }
-  }, [tmTab, artMonthFilter]);
+  }, [tmTab, completedMonth]);
 
   // Tick every second for live stopwatch
   useEffect(() => {
@@ -284,58 +284,72 @@ export default function TaskManagementView({ onNavigateToClient }) {
     return base;
   };
 
-  // Project deadline tasks for the selected date + overdue (not done) tasks
-  // Completed tasks: show on completedAt date (fallback to deadline if no completedAt)
-  const todayProjTasks = useMemo(() => {
-    const result = [];
-    (projects || []).forEach((p) => {
-      const pcc = (CAT_COLORS[(p.services || [p.category])[0]] || CAT_COLORS["SEO"]);
-      (p.tasks || []).forEach((t) => {
-        if (!t.deadline) return;
-        const d = dl(t.deadline);
-        if (t.done) {
-          // Completed: show on completedAt date (fallback to deadline)
-          const compDate = t.completedAt ? dl(t.completedAt) : d;
-          if (compDate === date) {
-            result.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color });
-          }
-        } else {
-          // Not done: show on deadline date + overdue carry-over
-          if (d === date) {
-            result.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color, _isOverdue: !!t.rescheduledFrom });
-          } else if (d < date) {
-            result.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color, _isOverdue: true });
-          }
-        }
-      });
+  // Project/client tasks for the selected date (from tasks table)
+  const [todayProjTasks, setTodayProjTasks] = useState([]);
+  const loadProjTasksForDate = useCallback(async () => {
+    const rows = await fetchClientTasksForDate(date);
+    // Enrich with project color info
+    const result = rows.map((t) => {
+      const projMatch = (projects || []).find((p) => p.name === (t.clientName || t.project));
+      const pcc = projMatch ? (CAT_COLORS[(projMatch.services || [projMatch.category])[0]] || CAT_COLORS["SEO"]) : { color: T.accent };
+      const d = dl(t.deadline);
+      const isOverdue = d && d < date && d < todayKey();
+      return { id: t.id, text: t.name, done: t.done, deadline: t.deadline, linkId: t.linkId, service: t.service, memo: t.memo, taskType: t.taskType, _pid: projMatch?.id || "__daily", _pname: t.clientName || t.project || "日次タスク", _pcc: pcc.color, _isOverdue: isOverdue, _dbId: t.id };
     });
-    return result;
-  }, [projects, date]);
+    setTodayProjTasks(result);
+  }, [date, projects]);
+  useEffect(() => { loadProjTasksForDate(); }, [loadProjTasksForDate]);
 
   // Dedup: exclude project tasks already in dayTasks (by linkId)
   const dayTaskLinkIds = useMemo(() => new Set(dayTasks.filter(t => t.linkId).map(t => t.linkId)), [dayTasks]);
   const extraProjTasks = useMemo(() => todayProjTasks.filter(t => !t.linkId || !dayTaskLinkIds.has(t.linkId)), [todayProjTasks, dayTaskLinkIds]);
-  // Split project tasks: regular (default) vs inprog (taskType === "inprogress")
-  const regularProjTasks = useMemo(() => extraProjTasks.filter(t => t.taskType !== "inprogress"), [extraProjTasks]);
+  // Split project tasks: regular (default) vs inprog
+  // 進行中タスクは「期限が閲覧日」or「期限切れ（overdue）」のものだけ today タブに表示
+  // 過去日を閲覧時: 未完了の繰越タスクは「今日」に表示されるため非表示
+  const regularProjTasks = useMemo(() => {
+    const today = todayKey();
+    return extraProjTasks.filter(t => {
+      // 過去日: 未完了の繰越タスクは今日に移動済みなので非表示
+      if (date < today && !t.done) return false;
+      return t.taskType !== "inprogress" || (t.deadline && (dl(t.deadline) === date || t._isOverdue));
+    });
+  }, [extraProjTasks, date]);
   // Past date: count undone tasks that can be moved to today
   const undoneOnPastDate = useMemo(() => date < todayKey() ? regularProjTasks.filter(t => !t.done).length : 0, [regularProjTasks, date]);
   // Today: count tasks that carried over (for badge display)
   const overdueCount = useMemo(() => regularProjTasks.filter(t => t._isOverdue && !t.done).length, [regularProjTasks]);
-  // In-progress project tasks: always show all (not filtered by date)
+  // In-progress project tasks: 期限が閲覧日のものは today タブに出すので、ここでは除外
+  const todayInprogLinkIds = useMemo(() => new Set(
+    regularProjTasks.filter(t => t.taskType === "inprogress").map(t => t.id)
+  ), [regularProjTasks]);
   const inprogProjTasks = useMemo(() => {
     const result = [];
+    const todayStr = todayKey();
     (projects || []).forEach((p) => {
       const pcc = (CAT_COLORS[(p.services || [p.category])[0]] || CAT_COLORS["SEO"]);
       (p.tasks || []).forEach((t) => {
-        if (t.taskType === "inprogress" && !t.done) {
-          result.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color });
-        }
+        if (t.taskType !== "inprogress" || t.done || todayInprogLinkIds.has(t.id)) return;
+        // 期限なし or 期限が今日以前のもののみ表示（未来のものは除外）
+        const d = t.deadline ? dl(t.deadline) : null;
+        if (d && d > todayStr) return;
+        result.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color });
       });
     });
     return result;
-  }, [projects]);
+  }, [projects, todayInprogLinkIds]);
 
-  const visibleDayTasks = useMemo(() => dayTasks.filter((t) => !dl(t.deadline) || dl(t.deadline) === date), [dayTasks, date]);
+  // 依頼・進行中は専用タブで表示するため、today タブには daily タスクのみ表示
+  // 過去日を閲覧時: 未完了の期限切れタスクは「今日」に繰越表示されるため、元の日には表示しない（1:1対応）
+  const visibleDayTasks = useMemo(() => {
+    const today = todayKey();
+    return dayTasks.filter((t) => {
+      if (t.taskType && t.taskType !== "daily") return false;
+      if (t.deadline && dl(t.deadline) !== date) return false;
+      // 過去日: 未完了で期限切れのタスクは今日ビューに移動済みなので非表示
+      if (date < today && !t.done && t.deadline && dl(t.deadline) <= today) return false;
+      return true;
+    });
+  }, [dayTasks, date]);
   const completed = visibleDayTasks.filter((t) => t.done).length + regularProjTasks.filter(t => t.done).length;
   const total = visibleDayTasks.length + regularProjTasks.length;
   const totalEstimate = visibleDayTasks.reduce((s, t) => s + (t.estimateSec || 0), 0) + regularProjTasks.reduce((s, t) => s + (t.estimateSec || 0), 0);
@@ -452,17 +466,13 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
   // Helper: update project task deadline (for tasks stored in projects state, not tasks table)
   const saveProjTaskDeadline = async (projId, taskId, iso) => {
-    const proj = (projects || []).find((p) => p.id === projId);
-    if (!proj) return;
-    const updatedTasks = (proj.tasks || []).map((tk) =>
-      tk.id === taskId ? { ...tk, deadline: iso } : tk
-    );
-    const updated = (projects || []).map((p) =>
-      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
-    );
-    saveProjects(updated);
-    const updatedProj = updated.find((p) => p.id === projId);
-    if (updatedProj) await upsertProject(updatedProj);
+    // Update directly in tasks table
+    await updateTaskDB(taskId, { deadline: iso });
+    // Optimistic update for today's project tasks
+    setTodayProjTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, deadline: iso } : t));
+    // Also sync JSONB for cross-view compat
+    const task = todayProjTasks.find((t) => t.id === taskId);
+    if (task?.linkId) await updateTaskByLinkId(task.linkId, { deadline: iso });
   };
 
   // Helper: reschedule undone tasks from the currently viewed (past) date to today
@@ -470,123 +480,71 @@ export default function TaskManagementView({ onNavigateToClient }) {
     const today = todayKey();
     if (date >= today) return; // only works on past dates
     const todayISO = today + "T00:00:00";
-    let updatedProjects = [...(projects || [])];
-    const affectedProjIds = new Set();
     let movedCount = 0;
-    updatedProjects = updatedProjects.map((p) => {
-      let changed = false;
-      const newTasks = (p.tasks || []).map((t) => {
-        if (!t.deadline || t.done || t.taskType === "inprogress") return t;
-        const d = dl(t.deadline);
-        if (d === date) {
-          changed = true;
-          movedCount++;
-          return { ...t, deadline: todayISO, rescheduledFrom: t.rescheduledFrom || d };
-        }
-        return t;
-      });
-      if (changed) {
-        affectedProjIds.add(p.id);
-        return { ...p, tasks: newTasks, updatedAt: Date.now() };
-      }
-      return p;
-    });
-    if (affectedProjIds.size === 0) return;
-    saveProjects(updatedProjects);
-    for (const pid of affectedProjIds) {
-      const proj = updatedProjects.find((p) => p.id === pid);
-      if (proj) await upsertProject(proj);
+
+    // 1) Project/client tasks (from todayProjTasks, backed by tasks table)
+    const undoneProjTasks = todayProjTasks.filter((t) => !t.done && t.taskType !== "inprogress");
+    for (const t of undoneProjTasks) {
+      await updateTaskDB(t.id, { deadline: todayISO, taskDate: today });
+      movedCount++;
     }
+
+    // 2) Daily tasks (dayTasks from tasks table)
+    const undoneDayTasks = dayTasks.filter((t) => !t.done && t.taskType !== "inprogress");
+    for (const t of undoneDayTasks) {
+      await updateTaskDB(t.id, { deadline: todayISO, taskDate: today });
+      movedCount++;
+    }
+
+    if (movedCount === 0) return;
     setToast(`📅 ${movedCount}件のタスクを今日に移動しました`);
     setDate(today); // 移動後、今日のビューに切り替え
   };
 
   // Helper: toggle project task type between regular and inprogress
   const toggleProjTaskType = async (projId, taskId) => {
-    const proj = (projects || []).find((p) => p.id === projId);
-    if (!proj) return;
-    const task = (proj.tasks || []).find((tk) => tk.id === taskId);
+    const task = todayProjTasks.find((t) => t.id === taskId);
     if (!task) return;
     const newType = task.taskType === "inprogress" ? "daily" : "inprogress";
-    const updatedTasks = (proj.tasks || []).map((tk) =>
-      tk.id === taskId ? { ...tk, taskType: newType, ballHolder: newType === "inprogress" ? (tk.ballHolder || "self") : undefined } : tk
-    );
-    const updated = (projects || []).map((p) =>
-      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
-    );
-    saveProjects(updated);
-    const updatedProj = updated.find((p) => p.id === projId);
-    if (updatedProj) await upsertProject(updatedProj);
+    // Update tasks table
+    await updateTaskDB(taskId, { taskType: newType, ballHolder: newType === "inprogress" ? (task._ball || "self") : null });
+    // Optimistic update
+    setTodayProjTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, taskType: newType } : t));
     setToast(newType === "inprogress" ? "🔄 進行中に変更" : "📋 通常タスクに変更");
   };
 
   // Helper: cycle ball holder on project task
   const cycleProjBallHolder = async (projId, taskId) => {
-    const proj = (projects || []).find((p) => p.id === projId);
-    if (!proj) return;
-    const task = (proj.tasks || []).find((tk) => tk.id === taskId);
+    const task = todayProjTasks.find((t) => t.id === taskId);
     if (!task) return;
-    const curIdx = BALL_HOLDERS.findIndex((b) => b.id === (task.ballHolder || "self"));
+    const curIdx = BALL_HOLDERS.findIndex((b) => b.id === (task._ball || "self"));
     const nextBall = BALL_HOLDERS[(curIdx + 1) % BALL_HOLDERS.length].id;
-    const updatedTasks = (proj.tasks || []).map((tk) =>
-      tk.id === taskId ? { ...tk, ballHolder: nextBall } : tk
-    );
-    const updated = (projects || []).map((p) =>
-      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
-    );
-    saveProjects(updated);
-    const updatedProj = updated.find((p) => p.id === projId);
-    if (updatedProj) await upsertProject(updatedProj);
+    await updateTaskDB(taskId, { ballHolder: nextBall });
+    setTodayProjTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, _ball: nextBall } : t));
   };
 
   // Helper: edit project task (name, estimate)
   const saveProjTaskEdit = async () => {
     if (!editingProjTask) return;
-    const { _pid, id, text, estimateMin, elapsedMin } = editingProjTask;
-    const proj = (projects || []).find((p) => p.id === _pid);
-    if (!proj) return;
-    // Include elapsedSec: from edit form if available, otherwise from projTimers
+    const { id, text, estimateMin, elapsedMin } = editingProjTask;
     const elapsedSec = elapsedMin !== undefined ? (elapsedMin || 0) * 60 : (projTimers[id]?.elapsed || 0);
-    const updatedTasks = (proj.tasks || []).map((tk) =>
-      tk.id === id ? { ...tk, text, estimateSec: (estimateMin || 0) * 60, elapsedSec } : tk
-    );
-    const updated = (projects || []).map((p) =>
-      p.id === _pid ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
-    );
-    saveProjects(updated);
-    const updatedProj = updated.find((p) => p.id === _pid);
-    if (updatedProj) await upsertProject(updatedProj);
+    await updateTaskDB(id, { name: text, estimateSec: (estimateMin || 0) * 60, elapsedSec });
+    setTodayProjTasks((prev) => prev.map((t) => t.id === id ? { ...t, text, estimateSec: (estimateMin || 0) * 60, elapsedSec } : t));
     setEditingProjTask(null);
   };
 
   // Helper: save memo on project task
   const saveProjMemo = async (projId, taskId) => {
-    const proj = (projects || []).find((p) => p.id === projId);
-    if (!proj) return;
-    const updatedTasks = (proj.tasks || []).map((tk) =>
-      tk.id === taskId ? { ...tk, memo: projMemoText || null } : tk
-    );
-    const updated = (projects || []).map((p) =>
-      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
-    );
-    saveProjects(updated);
-    const updatedProj = updated.find((p) => p.id === projId);
-    if (updatedProj) await upsertProject(updatedProj);
+    await updateTaskDB(taskId, { memo: projMemoText || null });
+    setTodayProjTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, memo: projMemoText || null } : t));
     setEditingProjMemo(null);
     setProjMemoText("");
   };
 
   // Helper: delete project task
   const deleteProjTask = async (projId, taskId) => {
-    const proj = (projects || []).find((p) => p.id === projId);
-    if (!proj) return;
-    const updatedTasks = (proj.tasks || []).filter((tk) => tk.id !== taskId);
-    const updated = (projects || []).map((p) =>
-      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
-    );
-    saveProjects(updated);
-    const updatedProj = updated.find((p) => p.id === projId);
-    if (updatedProj) await upsertProject(updatedProj);
+    await deleteTaskDB(taskId);
+    setTodayProjTasks((prev) => prev.filter((t) => t.id !== taskId));
   };
 
   const renderDeadline = (taskId, deadline, { prefix = "〆 ", color = T.warning, overrideColor, fontSize = 9, afterSave, showEmpty = false } = {}) => {
@@ -669,25 +627,15 @@ export default function TaskManagementView({ onNavigateToClient }) {
     return base;
   };
 
-  // Persist project task elapsed time to Supabase
+  // Persist project task elapsed time to tasks table
   const persistProjElapsed = useCallback(async (projId, taskId, elapsedSec) => {
-    const proj = (projects || []).find((p) => p.id === projId);
-    if (!proj) return;
-    const updatedTasks = (proj.tasks || []).map((t) =>
-      t.id === taskId ? { ...t, elapsedSec } : t
-    );
-    const updated = (projects || []).map((p) =>
-      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
-    );
-    saveProjects(updated);
-    const updatedProj = updated.find((p) => p.id === projId);
-    if (updatedProj) await upsertProject(updatedProj);
-  }, [projects, saveProjects]);
+    await updateTaskDB(taskId, { elapsedSec });
+  }, []);
 
   const toggleProjTimer = (projId, taskId) => {
     const pt = projTimers[taskId] || { running: false, startedAt: null, elapsed: 0 };
     if (pt.running) {
-      // Pausing - calculate elapsed and persist to Supabase
+      // Pausing - calculate elapsed and persist
       const extra = pt.startedAt ? Math.floor((Date.now() - pt.startedAt) / 1000) : 0;
       const newElapsed = (pt.elapsed || 0) + extra;
       setProjTimers((prev) => ({ ...prev, [taskId]: { running: false, startedAt: null, elapsed: newElapsed } }));
@@ -700,9 +648,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
           const extra = v.startedAt ? Math.floor((Date.now() - v.startedAt) / 1000) : 0;
           const newElapsed = (v.elapsed || 0) + extra;
           next[k] = { running: false, startedAt: null, elapsed: newElapsed };
-          // Persist the stopped timer
-          const ownerProj = (projects || []).find(p => (p.tasks || []).some(t => t.id === k));
-          if (ownerProj) persistProjElapsed(ownerProj.id, k, newElapsed);
+          persistProjElapsed(null, k, newElapsed);
         } else {
           next[k] = v;
         }
@@ -713,24 +659,17 @@ export default function TaskManagementView({ onNavigateToClient }) {
   };
 
   const toggleProjDone = async (projId, taskId) => {
-    const proj = (projects || []).find((p) => p.id === projId);
-    if (!proj) return;
-    const task = (proj.tasks || []).find((t) => t.id === taskId);
+    // Find task in todayProjTasks (loaded from tasks table)
+    const task = todayProjTasks.find((t) => t.id === taskId);
     if (!task) return;
     const newDone = !task.done;
-    const updatedTasks = (proj.tasks || []).map((t) =>
-      t.id === taskId ? { ...t, done: newDone, completedAt: newDone ? new Date().toISOString() : null } : t
-    );
-    const updated = (projects || []).map((p) =>
-      p.id === projId ? { ...p, tasks: updatedTasks, updatedAt: Date.now() } : p
-    );
-    saveProjects(updated);
-    const updatedProj = updated.find((p) => p.id === projId);
-    if (updatedProj) await upsertProject(updatedProj);
-    if (task.linkId) {
-      syncTaskStatus(task.linkId, newDone);
-      await updateTaskByLinkId(task.linkId, { done: newDone });
-    }
+    const completedAt = newDone ? new Date().toISOString() : null;
+    // Optimistic update
+    setTodayProjTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, done: newDone, completedAt } : t));
+    // Persist to tasks table (source of truth)
+    await updateTaskDB(taskId, { done: newDone, completedAt });
+    // Sync JSONB + tasks state for cross-view compatibility
+    if (task.linkId) syncTaskStatus(task.linkId, newDone);
   };
 
   // ── Delegation CRUD ──
@@ -851,89 +790,6 @@ export default function TaskManagementView({ onNavigateToClient }) {
     await deleteTaskDB(id);
   };
 
-  // ── Check Results helpers ──
-  const getCheckResult = (projectName) => {
-    return checkResults.find((r) => r.projectName === projectName && r.status === "done");
-  };
-
-  const CHECK_API = import.meta.env.VITE_CHECK_API || "http://localhost:8765";
-
-  const startArticleCheck = async (projectName) => {
-    // Try API server - server reads spreadsheet for articles
-    try {
-      const res = await fetch(`${CHECK_API}/api/check`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project: projectName, month: artMonthFilter }),
-      });
-      const data = await res.json();
-
-      if (data.error === "already_running") {
-        setToast("⚡ このプロジェクトは既にチェック中です");
-        return;
-      }
-      if (data.job_id) {
-        setCheckingJobs((prev) => ({ ...prev, [projectName]: { jobId: data.job_id, status: "running", progress: 0, total: artList.length, step: "開始中...", article: "" } }));
-        setToast(`🔍 ${projectName} のチェックを開始しました`);
-        // Start polling
-        pollCheckStatus(projectName, data.job_id);
-        return;
-      }
-    } catch {
-      // API server not running - fallback to copy command
-    }
-
-    // Fallback: copy command
-    const cmd = `cd ~/Downloads/seo-agent-project/seo-checker && python agent.py --month ${artMonthFilter} --project "${projectName}"`;
-    navigator.clipboard.writeText(cmd).then(() => {
-      setToast("📋 APIサーバー未起動のためコマンドをコピーしました");
-    });
-    setCheckCmd({ project: projectName, month: artMonthFilter, cmd });
-  };
-
-  const pollCheckStatus = (projectName, jobId) => {
-    const poll = async () => {
-      try {
-        const res = await fetch(`${CHECK_API}/api/job/${jobId}`);
-        const job = await res.json();
-        if (job.status === "done") {
-          setCheckingJobs((prev) => { const n = { ...prev }; delete n[projectName]; return n; });
-          reloadCheckResults();
-          setToast(`✅ ${projectName} のチェック完了！`);
-          return;
-        }
-        if (job.status === "running") {
-          setCheckingJobs((prev) => ({
-            ...prev,
-            [projectName]: {
-              jobId, status: "running",
-              progress: job.progress || 0, total: job.total || 1,
-              step: job.current_step || "",
-              article: job.current_article || "",
-            },
-          }));
-          setTimeout(poll, 5000); // Poll every 5s
-        }
-      } catch {
-        // Server disconnected - keep showing last status
-        setTimeout(poll, 15000);
-      }
-    };
-    setTimeout(poll, 3000); // First poll after 3s
-  };
-
-  const copyCheckCommand = (projectName) => {
-    const cmd = `cd ~/Downloads/seo-agent-project/seo-checker && python agent.py --month ${artMonthFilter} --project "${projectName}"`;
-    navigator.clipboard.writeText(cmd).then(() => {
-      setToast(`📋 コマンドをコピーしました`);
-    });
-    setCheckCmd({ project: projectName, month: artMonthFilter, cmd });
-  };
-
-  const reloadCheckResults = () => {
-    fetchCheckResults(null, artMonthFilter).then(setCheckResults).catch(() => setCheckResults([]));
-  };
-
   // ── Navigation ──
   const prevDay = () => { const d = new Date(date); d.setDate(d.getDate() - 1); setDate(d.toISOString().slice(0, 10)); };
   const nextDay = () => { const d = new Date(date); d.setDate(d.getDate() + 1); setDate(d.toISOString().slice(0, 10)); };
@@ -963,6 +819,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
             { id: "deleg", label: "👥 依頼", badge: pendingDelegCount },
             { id: "monthly", label: "📆 月次", badge: recurring.length },
             { id: "articles", label: "📝 コンテンツSEO", badge: articles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length },
+            { id: "completed", label: "✅ 完了" },
           ].map((t) => (
             <button key={t.id} onClick={() => setTmTab(t.id)} style={{
               padding: "6px 10px", fontSize: 11, fontWeight: tmTab === t.id ? 600 : 400,
@@ -1105,7 +962,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
                         <span style={{ fontSize: 13, fontWeight: 500, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.text}</span>
                       </div>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
-                        {renderDeadline(t.id, t.deadline, { prefix: "〆 ", fontSize: 10, overrideColor: isOver ? T.error : T.textMuted, afterSave: (id, iso) => saveProjTaskDeadline(t._pid, id, iso) })}
+                        {renderDeadline(t.id, t.deadline, { prefix: "〆 ", fontSize: 10, showEmpty: true, overrideColor: isOver ? T.error : T.textMuted, afterSave: async (id, iso) => { await saveProjTaskDeadline(t._pid, id, iso); if (iso && iso.slice(0, 10) !== date) { setToast(`📅 ${t.text} を ${iso.slice(5, 10).replace("-", "/")} に移動`); } } })}
                         {t.rescheduledFrom && <span style={{ fontSize: 9, color: T.warning }}>← {t.rescheduledFrom.slice(5).replace("-", "/")}</span>}
                         <span style={{ fontSize: 10, color: T.textMuted }}>見積: {fmtSec(estSec)}</span>
                         {t.memo && <span style={{ fontSize: 10, color: T.warning }}>📝</span>}
@@ -1164,7 +1021,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
                       <span style={{ fontSize: 13, fontWeight: 500, color: task.done ? T.textMuted : T.text, textDecoration: task.done ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{task.name}</span>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
-                      {task.deadline && renderDeadline(task.id, task.deadline, { prefix: "〆 ", fontSize: 10, overrideColor: dl(task.deadline) < todayKey() ? T.error : T.textMuted, afterSave: async (id, iso) => { setDayTasks((prev) => prev.map((dt) => dt.id === id ? { ...dt, deadline: iso } : dt)); await updateTaskDB(id, { deadline: iso }); } })}
+                      {renderDeadline(task.id, task.deadline, { prefix: "〆 ", fontSize: 10, showEmpty: true, overrideColor: dl(task.deadline) < todayKey() ? T.error : T.textMuted, afterSave: async (id, iso) => { setDayTasks((prev) => prev.map((dt) => dt.id === id ? { ...dt, deadline: iso } : dt)); await updateTaskDB(id, { deadline: iso, taskDate: iso ? iso.slice(0, 10) : date }); if (iso && iso.slice(0, 10) !== date) { setToast(`📅 ${task.name} を ${iso.slice(5, 10).replace("-", "/")} に移動`); setTimeout(() => loadDayTasks(), 300); } } })}
                       <span style={{ fontSize: 10, color: T.textMuted }}>見積: {fmtSec(task.estimateSec || 0)}</span>
                       {task.memo && <span style={{ fontSize: 10, color: T.warning }}>📝</span>}
                     </div>
@@ -1455,23 +1312,11 @@ export default function TaskManagementView({ onNavigateToClient }) {
       {/* ═══ LIST TAB (Unified Task List - matches original) ═══ */}
       {tmTab === "list" && (() => {
         const today = todayKey();
-        // Aggregate ALL tasks from all sources
-        const allTasks = [];
-        // 1. Project/client tasks
-        (projects || []).forEach((p) => {
-          const pcc = (CAT_COLORS[(p.services || [p.category])[0]] || CAT_COLORS["SEO"]);
-          (p.tasks || []).forEach((t) => {
-            allTasks.push({ ...t, _pid: p.id, _pname: p.name, _pcc: pcc.color, _src: "project" });
-          });
-        });
-        // 2. Daily tasks (from tasks table, not already linked to projects)
-        allActiveTasks.forEach((t) => {
-          // Skip if already represented by a project task (via linkId or same name+project)
-          if (t.linkId && allTasks.some((at) => at.linkId === t.linkId)) return;
-          if (t.name && t.project && allTasks.some((at) => at.text === t.name && at._pname === t.project)) return;
-          const projMatch = (projects || []).find((p) => p.name === t.project);
+        // All tasks from tasks table (unified source)
+        const allTasks = allActiveTasks.map((t) => {
+          const projMatch = (projects || []).find((p) => p.name === (t.clientName || t.project));
           const pcc = projMatch ? (CAT_COLORS[(projMatch.services || [projMatch.category])[0]] || CAT_COLORS["SEO"]).color : T.accent;
-          allTasks.push({ id: t.id, text: t.name, done: t.done || false, deadline: t.deadline || "", _pid: "__daily", _pname: t.project || "日次タスク", _pcc: pcc, _src: "daily" });
+          return { id: t.id, text: t.name, done: t.done || false, deadline: t.deadline || "", linkId: t.linkId, _pid: projMatch?.id || "__daily", _pname: t.clientName || t.project || "日次タスク", _pcc: pcc, _ball: t.ballHolder, _src: "unified" };
         });
         const open = allTasks.filter((t) => !t.done);
         const overdue = open.filter((t) => dl(t.deadline) && dl(t.deadline) < today).sort((a, b) => dl(a.deadline) > dl(b.deadline) ? 1 : -1);
@@ -1480,14 +1325,11 @@ export default function TaskManagementView({ onNavigateToClient }) {
         const noDl = open.filter((t) => !dl(t.deadline));
 
         const toggleListTask = async (t) => {
-          if (t._src === "project") {
-            await toggleProjDone(t._pid, t.id);
-          } else if (t._src === "daily") {
-            await updateTaskDB(t.id, { done: true, completedAt: new Date().toISOString() });
-            if (t.linkId) syncTaskStatus(t.linkId, true);
-            loadAllActive();
-            loadDayTasks();
-          }
+          await updateTaskDB(t.id, { done: true, completedAt: new Date().toISOString() });
+          if (t.linkId) syncTaskStatus(t.linkId, true);
+          loadAllActive();
+          loadDayTasks();
+          loadProjTasksForDate();
         };
 
         const renderTaskRow = (t) => {
@@ -1495,17 +1337,15 @@ export default function TaskManagementView({ onNavigateToClient }) {
           const isToday = dl(t.deadline) && dl(t.deadline) === today;
           const bh = BALL_HOLDERS.find((b) => b.id === t._ball);
           return (
-            <div key={t.id + t._pid + (t._src || "")} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: `1px solid ${T.border}22` }}>
+            <div key={t.id + t._pid} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: `1px solid ${T.border}22` }}>
               <button onClick={() => toggleListTask(t)} style={{ width: 20, height: 20, borderRadius: "50%", border: `2px solid ${t.done ? T.success : t._pcc}`, background: t.done ? T.success + "22" : "transparent", cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: T.success }}>{t.done ? "✓" : ""}</button>
-              {t._src === "daily" && <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 4, background: T.accent + "18", color: T.accent, fontWeight: 600, flexShrink: 0 }}>日次</span>}
               <span style={{ width: 7, height: 7, borderRadius: "50%", background: t._pcc, flexShrink: 0 }} />
               <button onClick={() => onNavigateToClient && onNavigateToClient(t._pname)} style={{ color: T.cyan, fontSize: 12, flexShrink: 0, maxWidth: 100, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", background: "none", border: `1px solid ${T.cyan}33`, borderRadius: 4, padding: "1px 6px", cursor: "pointer", fontFamily: T.font }}>{t._pname}</button>
               {bh && <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 99, background: bh.color + "12", color: bh.color, fontWeight: 600, flexShrink: 0 }}>{bh.label}</span>}
               <span style={{ flex: 1, fontSize: 14, color: t.done ? T.textDim : T.text, textDecoration: t.done ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.text}</span>
               {renderDeadline(t.id, t.deadline, { prefix: "", fontSize: 11, overrideColor: isOver ? T.error : isToday ? T.warning : T.textDim, afterSave: async (id, iso) => {
-                if (t._src === "project") { await saveProjTaskDeadline(t._pid, id, iso); }
-                else { await updateTaskDB(id, { deadline: iso }); }
-                loadAllActive(); loadSpecialTasks();
+                await updateTaskDB(id, { deadline: iso });
+                loadAllActive(); loadProjTasksForDate();
               } })}
             </div>
           );
@@ -1540,7 +1380,23 @@ export default function TaskManagementView({ onNavigateToClient }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
               <div style={{ fontSize: 15, fontWeight: 600, color: T.text }}>全保持タスク一覧（未完了 {open.length}件）</div>
-              <Btn variant="ghost" onClick={loadAllActive} style={{ fontSize: 11, padding: "4px 10px" }}>🔄</Btn>
+              <div style={{ display: "flex", gap: 4 }}>
+                <button onClick={() => {
+                  if (open.length === 0) { setToast("⚠️ エクスポートするタスクがありません"); return; }
+                  const header = "案件名\tタスク名\t期限\tステータス\tボール";
+                  const rows = open.map((t) => [
+                    t._pname || "",
+                    (t.text || "").replace(/\t/g, " ").replace(/\n/g, " "),
+                    t.deadline ? dl(t.deadline) : "",
+                    t.done ? "完了" : (dl(t.deadline) && dl(t.deadline) < today ? "期限超過" : "未完了"),
+                    BALL_HOLDERS.find((b) => b.id === t._ball)?.label || "",
+                  ].join("\t"));
+                  navigator.clipboard.writeText(header + "\n" + rows.join("\n")).then(() => {
+                    setToast(`📋 ${open.length}件をコピーしました（スプレッドシートに貼り付けできます）`);
+                  });
+                }} style={{ padding: "4px 10px", fontSize: 11, background: "#7C3AED", color: "#fff", border: "none", borderRadius: T.radiusXs, cursor: "pointer", fontFamily: T.font }}>📋 TSVコピー</button>
+                <Btn variant="ghost" onClick={loadAllActive} style={{ fontSize: 11, padding: "4px 10px" }}>🔄</Btn>
+              </div>
             </div>
 
             <Card style={{ padding: "8px 0" }}>
@@ -1961,8 +1817,6 @@ export default function TaskManagementView({ onNavigateToClient }) {
             const isSelf = curStep && curStep.self;
             const badgeColor = isSelf ? T.error : (curStep ? T.accent : T.textMuted);
             const expanded = expandedArt === art.id;
-            const cr = getCheckResult(art.project || art.name);
-            const isWritingReview = art.status === "writing_review";
             return (
               <Card key={art.id} style={{ border: `1px solid ${isSelf ? T.error + "44" : badgeColor + "22"}`, background: isSelf ? T.error + "06" : undefined }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1973,41 +1827,6 @@ export default function TaskManagementView({ onNavigateToClient }) {
                   </span>
                   {/* Project name */}
                   <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>{art.project || art.name}</span>
-                  {/* Check result badge */}
-                  {cr && (
-                    <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 4, background: cr.finalcheckVerdict === "GO" ? T.success + "15" : T.error + "15", color: cr.finalcheckVerdict === "GO" ? T.success : T.error, fontWeight: 600, whiteSpace: "nowrap", cursor: "pointer" }}
-                      onClick={() => setExpandedResult(expandedResult === art.id ? null : art.id)}>
-                      {cr.finalcheckVerdict === "GO" ? "🟢GO" : "🔴NO GO"} {cr.factcheckCritical > 0 ? `🔴${cr.factcheckCritical}` : ""}{cr.factcheckWarning > 0 ? ` 🟡${cr.factcheckWarning}` : ""}
-                    </span>
-                  )}
-                  {/* Check button / running status */}
-                  {(() => {
-                    const pName = art.project || art.name;
-                    const job = checkingJobs[pName];
-                    if (job) {
-                      // Show running animation
-                      const pct = job.total > 0 ? Math.round((job.progress / job.total) * 100) : 0;
-                      return (
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <div style={{ position: "relative", width: 60, height: 6, background: T.border, borderRadius: 3, overflow: "hidden" }}>
-                            <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: `${pct}%`, background: "#7C3AED", borderRadius: 3, transition: "width 0.5s" }} />
-                            <div style={{ position: "absolute", left: 0, top: 0, height: "100%", width: "30%", background: "linear-gradient(90deg, transparent, rgba(124,58,237,0.4), transparent)", borderRadius: 3, animation: "shimmer 1.5s infinite" }} />
-                          </div>
-                          <span style={{ fontSize: 8, color: "#7C3AED", fontWeight: 600, whiteSpace: "nowrap", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis" }}>
-                            {job.step || "準備中..."}
-                          </span>
-                          <span style={{ fontSize: 8, color: T.textMuted }}>{job.progress}/{job.total}</span>
-                          <style>{`@keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }`}</style>
-                        </div>
-                      );
-                    }
-                    if (isWritingReview) {
-                      return (
-                        <button onClick={() => startArticleCheck(pName)} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "#7C3AED15", color: "#7C3AED", border: `1px solid #7C3AED33`, cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>🔍 チェック</button>
-                      );
-                    }
-                    return null;
-                  })()}
                   {/* Progress dots: green=done, red/blue=current, gray=future */}
                   <div style={{ display: "flex", gap: 3 }}>
                     {ART_STEPS.map((s, i) => (
@@ -2032,30 +1851,6 @@ export default function TaskManagementView({ onNavigateToClient }) {
                   </button>
                   <button onClick={() => setExpandedArt(expanded ? null : art.id)} style={{ fontSize: 10, background: "none", border: "none", cursor: "pointer", color: T.textMuted, fontFamily: T.font }}>{expanded ? "▼" : "▶"}</button>
                 </div>
-                {/* Check result details (expandable) */}
-                {expandedResult === art.id && cr && (
-                  <div style={{ marginTop: 8, padding: "8px 10px", background: T.bg, borderRadius: T.radiusXs, border: `1px solid ${T.border}`, fontSize: 11 }}>
-                    <div style={{ fontWeight: 600, color: T.text, marginBottom: 6 }}>🔍 チェック結果 ({(cr.checkedAt || "").slice(0, 10)})</div>
-                    <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 6 }}>
-                      <span style={{ color: T.text }}>ファクトチェック: <span style={{ color: T.error, fontWeight: 600 }}>🔴{cr.factcheckCritical}</span> <span style={{ color: T.warning, fontWeight: 600 }}>🟡{cr.factcheckWarning}</span> <span style={{ color: T.accent, fontWeight: 600 }}>🔵{cr.factcheckInfo}</span></span>
-                      <span style={{ color: T.text }}>誤字脱字: <span style={{ fontWeight: 600 }}>{cr.finalcheckTypos}件</span></span>
-                      <span style={{ color: cr.finalcheckVerdict === "GO" ? T.success : T.error, fontWeight: 700 }}>{cr.finalcheckVerdict === "GO" ? "🟢 GO" : "🔴 NO GO"}</span>
-                      {cr.commentsInserted > 0 && <span style={{ color: T.textMuted }}>💬 {cr.commentsInserted}件コメント挿入済</span>}
-                    </div>
-                    {cr.factcheckDetail && (
-                      <details style={{ marginTop: 4 }}>
-                        <summary style={{ fontSize: 10, color: T.textMuted, cursor: "pointer" }}>ファクトチェック詳細</summary>
-                        <pre style={{ fontSize: 9, color: T.textDim, whiteSpace: "pre-wrap", maxHeight: 200, overflowY: "auto", marginTop: 4, padding: 6, background: T.bgCard, borderRadius: 4 }}>{cr.factcheckDetail}</pre>
-                      </details>
-                    )}
-                    {cr.finalcheckDetail && (
-                      <details style={{ marginTop: 4 }}>
-                        <summary style={{ fontSize: 10, color: T.textMuted, cursor: "pointer" }}>最終チェック詳細</summary>
-                        <pre style={{ fontSize: 9, color: T.textDim, whiteSpace: "pre-wrap", maxHeight: 200, overflowY: "auto", marginTop: 4, padding: 6, background: T.bgCard, borderRadius: 4 }}>{cr.finalcheckDetail}</pre>
-                      </details>
-                    )}
-                  </div>
-                )}
                 {/* Expanded controls */}
                 {expanded && (
                   <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
@@ -2110,96 +1905,6 @@ export default function TaskManagementView({ onNavigateToClient }) {
             </div>
           )}
 
-          {/* ── Check Results Summary ── */}
-          {checkResults.length > 0 && (
-            <Card style={{ borderLeft: "4px solid #7C3AED", marginTop: 4 }}>
-              <details>
-                <summary style={{ fontSize: 12, fontWeight: 600, color: T.text, cursor: "pointer" }}>
-                  🔍 チェック結果サマリー ({checkResults.length}件)
-                  {(() => { const go = checkResults.filter(r => r.finalcheckVerdict === "GO").length; const nogo = checkResults.filter(r => r.finalcheckVerdict === "NO_GO").length; return ` — 🟢${go} / 🔴${nogo}`; })()}
-                </summary>
-                <div style={{ marginTop: 8, overflowX: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
-                    <thead>
-                      <tr style={{ borderBottom: `2px solid ${T.border}` }}>
-                        <th style={{ textAlign: "left", padding: "4px 6px", color: T.textMuted, fontSize: 9 }}>KW</th>
-                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>FC 🔴</th>
-                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>FC 🟡</th>
-                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>誤字</th>
-                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>判定</th>
-                        <th style={{ textAlign: "center", padding: "4px 4px", color: T.textMuted, fontSize: 9 }}>💬</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {checkResults.map((r) => (
-                        <tr key={r.id} style={{ borderBottom: `1px solid ${T.border}33` }}>
-                          <td style={{ padding: "4px 6px", color: T.text }}>{truncate(r.keyword, 20)}</td>
-                          <td style={{ textAlign: "center", padding: "4px 4px", color: r.factcheckCritical > 0 ? T.error : T.textDim, fontWeight: r.factcheckCritical > 0 ? 600 : 400 }}>{r.factcheckCritical}</td>
-                          <td style={{ textAlign: "center", padding: "4px 4px", color: r.factcheckWarning > 0 ? T.warning : T.textDim, fontWeight: r.factcheckWarning > 0 ? 600 : 400 }}>{r.factcheckWarning}</td>
-                          <td style={{ textAlign: "center", padding: "4px 4px", color: r.finalcheckTypos > 0 ? T.error : T.textDim, fontWeight: r.finalcheckTypos > 0 ? 600 : 400 }}>{r.finalcheckTypos}</td>
-                          <td style={{ textAlign: "center", padding: "4px 4px", color: r.finalcheckVerdict === "GO" ? T.success : T.error, fontWeight: 700 }}>{r.finalcheckVerdict === "GO" ? "🟢" : "🔴"}</td>
-                          <td style={{ textAlign: "center", padding: "4px 4px", color: T.textDim }}>{r.commentsInserted || 0}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  <div style={{ marginTop: 6, textAlign: "right" }}>
-                    <button onClick={reloadCheckResults} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "none", border: `1px solid ${T.border}`, color: T.textMuted, cursor: "pointer", fontFamily: T.font }}>🔄 更新</button>
-                  </div>
-                </div>
-              </details>
-            </Card>
-          )}
-
-          {/* ── Check Command Modal (fallback when API server not running) ── */}
-          {checkCmd && (
-            <Card style={{ border: `2px solid #F59E0B44`, background: "#F59E0B08" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: T.warning, marginBottom: 8 }}>⚠️ APIサーバー未起動</div>
-              <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 6 }}>
-                ボタンからの自動チェックにはAPIサーバーが必要です。ターミナルで以下を実行してください:
-              </div>
-              <div style={{ padding: "8px 10px", background: T.bg, borderRadius: T.radiusXs, border: `1px solid ${T.border}`, fontFamily: "monospace", fontSize: 10, color: "#7C3AED", wordBreak: "break-all", marginBottom: 6 }}>
-                cd ~/Downloads/seo-agent-project/seo-checker && .venv/bin/python server.py
-              </div>
-              <div style={{ fontSize: 10, color: T.textDim, marginBottom: 6 }}>
-                サーバー起動後は🔍チェックボタンを押すだけで自動実行されます
-              </div>
-              <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8, marginTop: 4 }}>
-                <div style={{ fontSize: 10, color: T.textMuted, marginBottom: 4 }}>手動実行する場合（コピー済み）:</div>
-                <div style={{ padding: "6px 10px", background: T.bg, borderRadius: T.radiusXs, border: `1px solid ${T.border}`, fontFamily: "monospace", fontSize: 9, color: T.textDim, wordBreak: "break-all", marginBottom: 6 }}>
-                  {checkCmd.cmd}
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button onClick={() => { navigator.clipboard.writeText("cd ~/Downloads/seo-agent-project/seo-checker && .venv/bin/python server.py"); setToast("📋 サーバー起動コマンドをコピーしました"); }} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 4, background: "#7C3AED", color: "#fff", border: "none", cursor: "pointer", fontFamily: T.font }}>📋 サーバー起動コマンドをコピー</button>
-                <button onClick={() => setCheckCmd(null)} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 4, background: "none", border: `1px solid ${T.border}`, color: T.textMuted, cursor: "pointer", fontFamily: T.font }}>閉じる</button>
-              </div>
-            </Card>
-          )}
-
-          {/* ── Running jobs summary ── */}
-          {Object.keys(checkingJobs).length > 0 && (
-            <Card style={{ border: `2px solid #7C3AED44`, background: "#7C3AED06" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "#7C3AED", marginBottom: 8 }}>🔍 チェック実行中</div>
-              {Object.entries(checkingJobs).map(([pName, job]) => (
-                <div key={pName} style={{ marginBottom: 6 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                    <span style={{ fontSize: 11, fontWeight: 600, color: T.text }}>{pName}</span>
-                    <span style={{ fontSize: 10, color: T.textMuted }}>{job.progress}/{job.total}件</span>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <div style={{ flex: 1, height: 4, background: T.border, borderRadius: 2, overflow: "hidden" }}>
-                      <div style={{ height: "100%", width: `${job.total > 0 ? (job.progress / job.total) * 100 : 0}%`, background: "#7C3AED", borderRadius: 2, transition: "width 0.5s" }} />
-                    </div>
-                    <span style={{ fontSize: 9, color: "#7C3AED", whiteSpace: "nowrap" }}>
-                      {job.article ? `${job.article} - ` : ""}{job.step || "準備中..."}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </Card>
-          )}
-
           {/* Add article */}
           <Card style={{ border: `1px solid ${T.border}` }}>
             <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 6 }}>記事案件を追加</div>
@@ -2216,6 +1921,100 @@ export default function TaskManagementView({ onNavigateToClient }) {
           </Card>
         </div>
         );
+      })()}
+
+      {/* ═══ COMPLETED TAB ═══ */}
+      {tmTab === "completed" && (() => {
+        const totalElapsedSec = completedTasks.reduce((sum, t) => sum + (t.elapsedSec || 0), 0);
+        const totalHours = (totalElapsedSec / 3600).toFixed(1);
+        // Group by date (completedAt or deadline)
+        const grouped = {};
+        completedTasks.forEach((t) => {
+          const dateKey = (t.completedAt || t.deadline || t.taskDate || "不明").slice(0, 10);
+          if (!grouped[dateKey]) grouped[dateKey] = [];
+          grouped[dateKey].push(t);
+        });
+        const sortedDates = Object.keys(grouped).sort((a, b) => b > a ? 1 : -1);
+        // Group by client/project
+        const byClient = {};
+        completedTasks.forEach((t) => {
+          const key = t.clientName || t.project || "（案件なし）";
+          if (!byClient[key]) byClient[key] = { count: 0, elapsed: 0 };
+          byClient[key].count++;
+          byClient[key].elapsed += (t.elapsedSec || 0);
+        });
+        const clientEntries = Object.entries(byClient).sort((a, b) => b[1].elapsed - a[1].elapsed);
+
+        return (<>
+          {/* Month navigation */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <Btn variant="ghost" onClick={() => setCompletedMonth(prevMonthKey(completedMonth))} style={{ fontSize: 16, padding: "4px 8px" }}>←</Btn>
+            <span style={{ fontSize: 14, fontWeight: 600, color: T.text, minWidth: 100, textAlign: "center" }}>{monthLabel(completedMonth)}</span>
+            <Btn variant="ghost" onClick={() => setCompletedMonth(nextMonthKey(completedMonth))} style={{ fontSize: 16, padding: "4px 8px" }}>→</Btn>
+            {completedMonth !== curMonth() && <Btn variant="secondary" onClick={() => setCompletedMonth(curMonth())} style={{ fontSize: 11 }}>今月</Btn>}
+          </div>
+
+          {/* Summary cards */}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+            <Card style={{ flex: 1, minWidth: 120, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: T.textMuted, marginBottom: 4 }}>完了タスク数</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: T.success }}>{completedTasks.length}</div>
+            </Card>
+            <Card style={{ flex: 1, minWidth: 120, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: T.textMuted, marginBottom: 4 }}>稼働時間</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: T.accent }}>{totalHours}h</div>
+            </Card>
+            <Card style={{ flex: 1, minWidth: 120, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: T.textMuted, marginBottom: 4 }}>稼働日数</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: T.text }}>{sortedDates.filter((d) => d !== "不明").length}</div>
+            </Card>
+          </div>
+
+          {/* By client breakdown */}
+          {clientEntries.length > 0 && (
+            <Card style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: T.text, marginBottom: 8 }}>案件別サマリー</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {clientEntries.map(([name, data]) => (
+                  <div key={name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 0", borderBottom: `1px solid ${T.border}22` }}>
+                    <span style={{ fontSize: 11, color: T.text, flex: 1 }}>{truncate(name, 25)}</span>
+                    <span style={{ fontSize: 10, color: T.textMuted, marginRight: 12 }}>{data.count}件</span>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: T.accent }}>{(data.elapsed / 3600).toFixed(1)}h</span>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+
+          {loadingCompleted ? (
+            <div style={{ textAlign: "center", padding: 20, color: T.textMuted, fontSize: 12 }}>読み込み中...</div>
+          ) : completedTasks.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 20, color: T.textMuted, fontSize: 12 }}>この月の完了タスクはありません</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {sortedDates.map((dateKey) => {
+                const tasks = grouped[dateKey];
+                const dayElapsed = tasks.reduce((s, t) => s + (t.elapsedSec || 0), 0);
+                return (
+                  <Card key={dateKey}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: T.text }}>{dateKey === "不明" ? "日付不明" : dateLabel(dateKey)}</div>
+                      <div style={{ fontSize: 11, color: T.accent, fontWeight: 600 }}>{fmtSec(dayElapsed)}</div>
+                    </div>
+                    {tasks.map((t) => (
+                      <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 0", borderTop: `1px solid ${T.border}11` }}>
+                        <span style={{ color: T.success, fontSize: 10, flexShrink: 0 }}>✓</span>
+                        <span style={{ fontSize: 11, color: T.text, flex: 1 }}>{t.name}</span>
+                        {(t.clientName || t.project) && <span style={{ fontSize: 9, color: T.textMuted, background: T.bgCard, padding: "1px 6px", borderRadius: 4 }}>{truncate(t.clientName || t.project, 12)}</span>}
+                        {t.elapsedSec > 0 && <span style={{ fontSize: 10, color: T.accent, fontWeight: 500, whiteSpace: "nowrap" }}>{fmtSec(t.elapsedSec)}</span>}
+                      </div>
+                    ))}
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </>);
       })()}
     </div>
   );

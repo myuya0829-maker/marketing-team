@@ -6,117 +6,7 @@ import { supabase } from "../lib/supabase";
 
 const USER_ID = "anonymous";
 
-// ========================
-// Agent Rules
-// ========================
-export const fetchAgentRules = async () => {
-  const { data, error } = await supabase
-    .from("agent_rules")
-    .select("agent_id, rules")
-    .eq("user_id", USER_ID);
-  if (error) {
-    console.error("fetchAgentRules:", error);
-    return {};
-  }
-  const map = {};
-  for (const row of data) {
-    map[row.agent_id] = row.rules;
-  }
-  return map;
-};
-
-export const upsertAgentRule = async (agentId, rules) => {
-  const { error } = await supabase
-    .from("agent_rules")
-    .upsert(
-      { user_id: USER_ID, agent_id: agentId, rules, updated_at: new Date().toISOString() },
-      { onConflict: "user_id,agent_id" }
-    );
-  if (error) console.error("upsertAgentRule:", error);
-};
-
-// ========================
-// Knowledge
-// ========================
-export const fetchKnowledge = async () => {
-  const { data, error } = await supabase
-    .from("knowledge")
-    .select("*")
-    .eq("user_id", USER_ID)
-    .order("created_at", { ascending: false });
-  if (error) {
-    console.error("fetchKnowledge:", error);
-    return [];
-  }
-  return data.map((row) => ({
-    id: row.id,
-    title: row.title,
-    content: row.content,
-    category: row.category,
-    assignedAgents: row.assigned_agents || ["all"],
-    source: row.source,
-    date: row.created_at,
-  }));
-};
-
-export const insertKnowledge = async (item) => {
-  const { error } = await supabase.from("knowledge").insert({
-    user_id: USER_ID,
-    category: item.category,
-    title: item.title,
-    content: item.content,
-    assigned_agents: item.assignedAgents || ["all"],
-    source: item.source || "manual",
-  });
-  if (error) console.error("insertKnowledge:", error);
-};
-
-export const deleteKnowledgeById = async (id) => {
-  const { error } = await supabase
-    .from("knowledge")
-    .delete()
-    .eq("id", id)
-    .eq("user_id", USER_ID);
-  if (error) console.error("deleteKnowledge:", error);
-};
-
-// ========================
-// Feedbacks
-// ========================
-export const fetchFeedbacks = async () => {
-  const { data, error } = await supabase
-    .from("feedbacks")
-    .select("*")
-    .eq("user_id", USER_ID)
-    .order("created_at", { ascending: false });
-  if (error) {
-    console.error("fetchFeedbacks:", error);
-    return [];
-  }
-  return data.map((row) => ({
-    id: row.id,
-    task: row.task_title,
-    rating: row.rating,
-    comment: row.comment,
-    good: row.good,
-    bad: row.bad,
-    lesson: row.lesson,
-    date: row.created_at,
-  }));
-};
-
-export const insertFeedback = async (fb) => {
-  const { error } = await supabase.from("feedbacks").insert({
-    user_id: USER_ID,
-    task_title: fb.task,
-    rating: fb.rating,
-    comment: fb.comment,
-    good: fb.good || null,
-    bad: fb.bad || null,
-    lesson: fb.lesson || null,
-  });
-  if (error) console.error("insertFeedback:", error);
-};
+// (agent_rules / knowledge / feedbacks tables removed — Stack pivot 2026-04-10)
 
 // ========================
 // Tasks (daily + extended types)
@@ -190,6 +80,147 @@ export const fetchTasksByType = async (taskType) => {
   return data.map(mapTaskRow);
 };
 
+/**
+ * Fetch tasks for a specific project/client (for ClientDashboardView).
+ * Returns in JSONB-compatible format (text, service, linkId, etc.)
+ */
+// Deduplicate rows by link_id (keep first occurrence = most recently created)
+const dedup = (rows) => {
+  const seen = new Set();
+  return rows.filter((r) => {
+    const key = r.link_id || r.id;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
+export const fetchTasksByProject = async (projectName) => {
+  if (!projectName) return [];
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .or(`client_name.eq.${projectName},project.eq.${projectName}`)
+    .order("created_at", { ascending: true });
+  if (error) {
+    console.error("fetchTasksByProject:", error);
+    return [];
+  }
+  return dedup(data).map(mapTaskToJsonb);
+};
+
+/**
+ * Fetch ALL active tasks (unified, all types) for List tab.
+ * Excludes delegation/inprogress/article (shown in their own sections).
+ */
+export const fetchAllActiveTasksUnified = async () => {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .eq("done", false)
+    .or("task_type.eq.daily,task_type.is.null")
+    .order("deadline", { ascending: true, nullsFirst: false });
+  if (error) {
+    console.error("fetchAllActiveTasksUnified:", error);
+    return [];
+  }
+  return dedup(data).map(mapTaskRow);
+};
+
+/**
+ * Fetch task counts per client from the tasks table.
+ * Uses BOTH client_name and project columns (matching fetchTasksByProject logic).
+ * Deduplicates by link_id to avoid double-counting.
+ * Returns { "ClientName": { open: N, done: N } }
+ */
+export const fetchTaskCountsByClient = async () => {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("client_name, project, done, link_id")
+    .eq("user_id", USER_ID);
+  if (error) {
+    console.error("fetchTaskCountsByClient:", error);
+    return {};
+  }
+  // Deduplicate by link_id (keep first occurrence)
+  const seen = new Set();
+  const unique = [];
+  for (const row of data) {
+    if (row.link_id && seen.has(row.link_id)) continue;
+    if (row.link_id) seen.add(row.link_id);
+    unique.push(row);
+  }
+  const counts = {};
+  unique.forEach((row) => {
+    const name = row.client_name || row.project;
+    if (!name) return;
+    if (!counts[name]) counts[name] = { open: 0, done: 0 };
+    if (row.done) counts[name].done++;
+    else counts[name].open++;
+  });
+  return counts;
+};
+
+/**
+ * Fetch "extra" tasks for a given date — tasks NOT in dayTasks but relevant to that date.
+ * Specifically: undone tasks whose deadline <= date but task_date != date (overdue carry-over).
+ * This avoids overlap with fetchTasksForDateView (which fetches task_date = date).
+ * No client_name filter — includes ALL task types.
+ */
+/**
+ * Fetch "extra" tasks for a given date — tasks NOT in dayTasks but relevant to that date.
+ * 1) Undone tasks whose deadline <= date but task_date != date (overdue carry-over)
+ * 2) Done tasks whose deadline matches date but task_date != date (completed on that deadline date)
+ * This avoids overlap with fetchTasksForDateView (which fetches task_date = date).
+ */
+export const fetchClientTasksForDate = async (dateKey) => {
+  if (!dateKey) return [];
+  // Fetch undone tasks with deadline <= dateKey whose task_date is NOT dateKey
+  const { data: undone, error: e1 } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .eq("done", false)
+    .neq("task_date", dateKey)
+    .lte("deadline", dateKey + "T23:59:59")
+    .order("deadline", { ascending: true });
+  // Fetch done tasks whose deadline is on dateKey but task_date != dateKey
+  const { data: done, error: e2 } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .eq("done", true)
+    .neq("task_date", dateKey)
+    .gte("deadline", dateKey + "T00:00:00")
+    .lte("deadline", dateKey + "T23:59:59");
+  if (e1) console.error("fetchClientTasksForDate undone:", e1);
+  if (e2) console.error("fetchClientTasksForDate done:", e2);
+  return dedup([...(undone || []), ...(done || [])]).map(mapTaskRow);
+};
+
+// Map tasks table row → JSONB-compatible object (for ClientDashboardView)
+const mapTaskToJsonb = (row) => ({
+  id: row.id,
+  text: row.name,
+  done: row.done,
+  deadline: row.deadline ? row.deadline.slice(0, 10) : null,
+  completedAt: row.completed_at || null,
+  service: row.deadline_time, // deadline_time を service として再利用
+  linkId: row.link_id,
+  date: row.task_date || "",
+  memo: row.memo,
+  ballHolder: row.ball_holder,
+  taskType: row.task_type || "daily",
+  status: row.status,
+  subtasks: row.subtasks || [],
+  assignee: row.assignee,
+  elapsedSec: row.elapsed_sec || 0,
+  project: row.project,
+  _dbId: row.id, // tasks テーブルの行ID
+});
+
 const mapTaskRow = (row) => ({
   id: row.id,
   name: row.name,
@@ -204,7 +235,7 @@ const mapTaskRow = (row) => ({
   taskType: row.task_type || "daily",
   assignee: row.assignee,
   deadline: row.deadline,
-  deadlineTime: row.deadline_time,
+  service: row.deadline_time, // deadline_time カラムを service として再利用
   memo: row.memo,
   ballHolder: row.ball_holder,
   subtasks: row.subtasks || [],
@@ -212,6 +243,8 @@ const mapTaskRow = (row) => ({
   clientName: row.client_name,
   status: row.status,
   month: row.month,
+  taskDate: row.task_date,
+  completedAt: row.completed_at || null,
 });
 
 export const insertTask = async (dateKey, task) => {
@@ -231,7 +264,7 @@ export const insertTask = async (dateKey, task) => {
       task_type: task.taskType || "daily",
       assignee: task.assignee || null,
       deadline: task.deadline || null,
-      deadline_time: task.deadlineTime || null,
+      deadline_time: task.service || null, // deadline_time を service として再利用
       memo: task.memo || null,
       ball_holder: task.ballHolder || null,
       subtasks: task.subtasks || [],
@@ -263,7 +296,7 @@ export const updateTask = async (id, updates) => {
   if (updates.taskType !== undefined) mapped.task_type = updates.taskType;
   if (updates.assignee !== undefined) mapped.assignee = updates.assignee;
   if (updates.deadline !== undefined) mapped.deadline = updates.deadline;
-  if (updates.deadlineTime !== undefined) mapped.deadline_time = updates.deadlineTime;
+  if (updates.service !== undefined) mapped.deadline_time = updates.service; // deadline_time を service として再利用
   if (updates.memo !== undefined) mapped.memo = updates.memo;
   if (updates.ballHolder !== undefined) mapped.ball_holder = updates.ballHolder;
   if (updates.subtasks !== undefined) mapped.subtasks = updates.subtasks;
@@ -271,6 +304,8 @@ export const updateTask = async (id, updates) => {
   if (updates.clientName !== undefined) mapped.client_name = updates.clientName;
   if (updates.status !== undefined) mapped.status = updates.status;
   if (updates.month !== undefined) mapped.month = updates.month;
+  if (updates.taskDate !== undefined) mapped.task_date = updates.taskDate;
+  if (updates.completedAt !== undefined) mapped.completed_at = updates.completedAt;
 
   const { error } = await supabase.from("tasks").update(mapped).eq("id", id);
   if (error) console.error("updateTask:", error);
@@ -293,6 +328,12 @@ export const updateTaskByLinkId = async (linkId, updates) => {
   if (updates.name !== undefined) mapped.name = updates.name;
   if (updates.deadline !== undefined) mapped.deadline = updates.deadline;
   if (updates.memo !== undefined) mapped.memo = updates.memo;
+  if (updates.service !== undefined) mapped.deadline_time = updates.service;
+  if (updates.ballHolder !== undefined) mapped.ball_holder = updates.ballHolder;
+  if (updates.status !== undefined) mapped.status = updates.status;
+  if (updates.subtasks !== undefined) mapped.subtasks = updates.subtasks;
+  if (updates.assignee !== undefined) mapped.assignee = updates.assignee;
+  if (updates.completedAt !== undefined) mapped.completed_at = updates.completedAt;
   const { error } = await supabase.from("tasks").update(mapped).eq("link_id", linkId).eq("user_id", USER_ID);
   if (error) console.error("updateTaskByLinkId:", error);
 };
@@ -304,55 +345,153 @@ export const deleteTaskByLinkId = async (linkId) => {
   if (error) console.error("deleteTaskByLinkId:", error);
 };
 
-// Sync project tasks to tasks table (one-time migration for existing tasks)
-export const syncProjectTasksToDb = async (projects) => {
+/**
+ * Fetch all completed tasks for a given month (YYYY-MM format).
+ * Uses completed_at if set, otherwise falls back to deadline range.
+ */
+export const fetchCompletedTasksForMonth = async (monthKey) => {
+  if (!monthKey) return [];
+  const startDate = monthKey + "-01";
+  const endDate = monthKey + "-31T23:59:59";
+  // Query 1: tasks with completed_at in this month
+  const { data: byCompleted, error: e1 } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .eq("done", true)
+    .gte("completed_at", startDate)
+    .lte("completed_at", endDate)
+    .order("completed_at", { ascending: false });
+  // Query 2: tasks with deadline in this month but no completed_at (legacy)
+  const { data: byDeadline, error: e2 } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .eq("done", true)
+    .is("completed_at", null)
+    .gte("deadline", startDate)
+    .lte("deadline", endDate)
+    .order("deadline", { ascending: false });
+  if (e1) console.error("fetchCompletedTasksForMonth (completed_at):", e1);
+  if (e2) console.error("fetchCompletedTasksForMonth (deadline):", e2);
+  return dedup([...(byCompleted || []), ...(byDeadline || [])]).map(mapTaskRow);
+};
+
+/**
+ * Full migration: JSONB project tasks → tasks table (one-time).
+ * - Handles ALL tasks (including done ones, unlike the old syncProjectTasksToDb)
+ * - Generates linkId for tasks without one and updates JSONB
+ * - Syncs service field to deadline_time column
+ * - NEVER deletes anything
+ */
+export const migrateProjectTasksToTable = async (projects, upsertProjectFn) => {
   if (!projects || projects.length === 0) return;
-  // Collect all linkIds from project tasks
+  console.log("🔄 migrateProjectTasksToTable: 開始...");
+
+  // Collect ALL tasks from all projects
   const allProjectTasks = [];
+  const projectsNeedingUpdate = new Set(); // track projects whose JSONB needs linkId updates
   for (const p of projects) {
     for (const t of (p.tasks || [])) {
-      if (t.linkId && !t.done) {
-        allProjectTasks.push({ ...t, projectName: p.name });
+      if (!t.linkId) {
+        // Generate linkId for tasks that don't have one
+        t.linkId = "link-mig-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+        projectsNeedingUpdate.add(p.id);
       }
+      allProjectTasks.push({ ...t, _projectName: p.name, _projectId: p.id });
     }
   }
-  if (allProjectTasks.length === 0) return;
 
-  // Check which linkIds already exist in tasks table
-  const linkIds = allProjectTasks.map((t) => t.linkId);
-  const { data: existing } = await supabase
-    .from("tasks")
-    .select("link_id")
-    .eq("user_id", USER_ID)
-    .in("link_id", linkIds);
-  const existingSet = new Set((existing || []).map((r) => r.link_id));
-
-  // Insert missing tasks
-  const toInsert = allProjectTasks.filter((t) => !existingSet.has(t.linkId));
-  if (toInsert.length === 0) return;
-
-  const rows = toInsert.map((t) => ({
-    user_id: USER_ID,
-    task_date: t.date || new Date().toISOString().slice(0, 10),
-    name: t.text,
-    estimate_sec: 1800,
-    elapsed_sec: 0,
-    done: false,
-    timer_running: false,
-    project: t.projectName,
-    task_type: "daily",
-    deadline: t.deadline || null,
-    link_id: t.linkId,
-    client_name: t.projectName,
-  }));
-
-  const { error } = await supabase.from("tasks").insert(rows);
-  if (error) {
-    console.error("syncProjectTasksToDb:", error);
-  } else {
-    console.log(`✅ ${rows.length}件のクライアントタスクを同期`);
+  if (allProjectTasks.length === 0) {
+    console.log("🔄 migrateProjectTasksToTable: タスクなし、スキップ");
+    return;
   }
+
+  // Batch query existing linkIds in tasks table
+  const linkIds = allProjectTasks.map((t) => t.linkId).filter(Boolean);
+  const batchSize = 100;
+  const existingSet = new Set();
+  for (let i = 0; i < linkIds.length; i += batchSize) {
+    const batch = linkIds.slice(i, i + batchSize);
+    const { data } = await supabase
+      .from("tasks")
+      .select("link_id, deadline_time")
+      .eq("user_id", USER_ID)
+      .in("link_id", batch);
+    (data || []).forEach((r) => existingSet.add(r.link_id));
+  }
+
+  // Separate: tasks to insert vs tasks to update (service sync)
+  const toInsert = [];
+  const toUpdateService = [];
+  for (const t of allProjectTasks) {
+    if (!existingSet.has(t.linkId)) {
+      toInsert.push(t);
+    } else if (t.service) {
+      // Existing row might need service field update
+      toUpdateService.push(t);
+    }
+  }
+
+  // Batch insert new tasks
+  if (toInsert.length > 0) {
+    for (let i = 0; i < toInsert.length; i += batchSize) {
+      const batch = toInsert.slice(i, i + batchSize);
+      const rows = batch.map((t) => ({
+        user_id: USER_ID,
+        task_date: t.date || new Date().toISOString().slice(0, 10),
+        name: t.text || "",
+        estimate_sec: t.estimateSec || 1800,
+        elapsed_sec: t.elapsedSec || 0,
+        done: t.done || false,
+        timer_running: false,
+        project: t._projectName,
+        task_type: t.taskType || "daily",
+        deadline: t.deadline || null,
+        deadline_time: t.service || null, // service → deadline_time
+        link_id: t.linkId,
+        client_name: t._projectName,
+        memo: t.memo || null,
+        ball_holder: t.ballHolder || null,
+        status: t.status || null,
+        subtasks: t.subtasks || [],
+        assignee: t.assignee || null,
+      }));
+      const { error } = await supabase.from("tasks").insert(rows);
+      if (error) console.error("migrateProjectTasksToTable insert:", error);
+    }
+    console.log(`✅ ${toInsert.length}件の新規タスクを tasks テーブルに挿入`);
+  }
+
+  // Update service for existing rows
+  if (toUpdateService.length > 0) {
+    let updated = 0;
+    for (const t of toUpdateService) {
+      const { error } = await supabase.from("tasks")
+        .update({ deadline_time: t.service })
+        .eq("link_id", t.linkId)
+        .eq("user_id", USER_ID)
+        .is("deadline_time", null); // only update if not already set
+      if (!error) updated++;
+    }
+    if (updated > 0) console.log(`✅ ${updated}件の既存タスクに service を同期`);
+  }
+
+  // Update JSONB for projects that got new linkIds
+  if (projectsNeedingUpdate.size > 0 && upsertProjectFn) {
+    for (const p of projects) {
+      if (projectsNeedingUpdate.has(p.id)) {
+        await upsertProjectFn(p);
+      }
+    }
+    console.log(`✅ ${projectsNeedingUpdate.size}件のプロジェクト JSONB に linkId を追加`);
+  }
+
+  console.log("🔄 migrateProjectTasksToTable: 完了");
 };
+
+// Legacy alias (kept for backward compat)
+export const syncProjectTasksToDb = migrateProjectTasksToTable;
 
 // ========================
 // Clients
@@ -428,13 +567,43 @@ export const fetchProjects = async () => {
   }));
 };
 
+// ── 完了タスク保護: localStorage の完了IDでstale writeによる復活を防止 ──
+const DONE_KEY = "doneProjTaskIds";
+const _getDoneIds = () => { try { return new Set(JSON.parse(localStorage.getItem(DONE_KEY) || "[]")); } catch { return new Set(); } };
+const _protectTasks = (tasks, _caller) => {
+  const doneIds = _getDoneIds();
+  if (doneIds.size === 0 || !tasks || tasks.length === 0) return tasks;
+  let fixed = 0;
+  const result = tasks.map(t => {
+    if (doneIds.has(t.id) && !t.done) {
+      fixed++;
+      return { ...t, done: true, completedAt: t.completedAt || new Date().toISOString() };
+    }
+    return t;
+  });
+  if (fixed > 0) console.warn(`🛡️ _protectTasks(${_caller || "?"}): ${fixed}件の完了タスクを保護 (stale write防止)`);
+  return result;
+};
+export const protectProjectsDone = (projects) => {
+  const doneIds = _getDoneIds();
+  if (doneIds.size === 0) return projects;
+  console.log(`🔒 protectProjectsDone: localStorage に ${doneIds.size}件の完了ID`);
+  return projects.map(p => {
+    const tasks = p.tasks || [];
+    if (!tasks.some(t => doneIds.has(t.id) && !t.done)) return p;
+    return { ...p, tasks: _protectTasks(tasks, `load:${p.name}`) };
+  });
+};
+
 export const upsertProject = async (project) => {
+  // ★ Supabase書き込み前に完了タスク保護を適用
+  const protectedTasks = _protectTasks(project.tasks || [], `upsert:${project.name}`);
   const payload = {
     user_id: USER_ID,
     name: project.name,
     category: project.category || (project.services?.[0]) || "SEO",
     services: project.services || ["SEO"],
-    tasks: project.tasks || [],
+    tasks: protectedTasks,
     memos: project.memos || [],
     article_enabled: project.articleEnabled || false,
     spreadsheet_url: project.spreadsheetUrl || null,
@@ -458,114 +627,8 @@ export const deleteProject = async (id) => {
 
 // ========================
 // Reports
-// ========================
-export const fetchReports = async () => {
-  const { data, error } = await supabase
-    .from("reports")
-    .select("*")
-    .eq("user_id", USER_ID)
-    .order("created_at", { ascending: false });
-  if (error) {
-    console.error("fetchReports:", error);
-    return [];
-  }
-  return data.map((row) => ({
-    id: row.id,
-    task: row.task_title,
-    clientName: row.client_name,
-    finalOutput: row.final_output,
-    metadata: row.metadata,
-    date: row.created_at,
-  }));
-};
-
-export const insertReport = async (report) => {
-  const { error } = await supabase.from("reports").insert({
-    user_id: USER_ID,
-    task_title: report.task || report.taskTitle || "",
-    client_name: report.clientName || null,
-    final_output: report.finalOutput || report.output || "",
-    metadata: report.metadata || null,
-  });
-  if (error) console.error("insertReport:", error);
-};
-
-export const deleteReport = async (id) => {
-  const { error } = await supabase.from("reports").delete().eq("id", id).eq("user_id", USER_ID);
-  if (error) console.error("deleteReport:", error);
-};
-
-// ========================
-// Message Styles
-// ========================
-export const fetchMsgStyles = async () => {
-  const { data, error } = await supabase
-    .from("msg_styles")
-    .select("target, styles")
-    .eq("user_id", USER_ID);
-  if (error) {
-    console.error("fetchMsgStyles:", error);
-    return {};
-  }
-  const map = {};
-  for (const row of data) {
-    map[row.target] = row.styles || [];
-  }
-  return map;
-};
-
-export const upsertMsgStyle = async (target, styles) => {
-  const { error } = await supabase
-    .from("msg_styles")
-    .upsert(
-      { user_id: USER_ID, target, styles, updated_at: new Date().toISOString() },
-      { onConflict: "user_id,target" }
-    );
-  if (error) console.error("upsertMsgStyle:", error);
-};
-
-export const saveMsgStylesAll = async (stylesObj) => {
-  for (const [target, styles] of Object.entries(stylesObj)) {
-    await upsertMsgStyle(target, styles);
-  }
-};
-
-// ========================
-// Templates
-// ========================
-export const fetchTemplates = async () => {
-  const { data, error } = await supabase
-    .from("templates")
-    .select("*")
-    .eq("user_id", USER_ID)
-    .order("created_at", { ascending: false });
-  if (error) {
-    console.error("fetchTemplates:", error);
-    return [];
-  }
-  return data.map((row) => ({
-    id: row.id,
-    name: row.name,
-    content: row.content,
-    clientName: row.client_name,
-    date: row.created_at,
-  }));
-};
-
-export const insertTemplate = async (tpl) => {
-  const { error } = await supabase.from("templates").insert({
-    user_id: USER_ID,
-    name: tpl.name,
-    content: tpl.content,
-    client_name: tpl.clientName || null,
-  });
-  if (error) console.error("insertTemplate:", error);
-};
-
-export const deleteTemplate = async (id) => {
-  const { error } = await supabase.from("templates").delete().eq("id", id).eq("user_id", USER_ID);
-  if (error) console.error("deleteTemplate:", error);
-};
+// (reports / msg_styles tables removed — Stack pivot 2026-04-10)
+// (templates table kept for future use but no UI hookup)
 
 // ========================
 // Recurring Tasks
@@ -619,12 +682,13 @@ export const autoInsertRecurringTasks = async (dateKey, recurringList) => {
   if (matching.length === 0) return 0;
   const existing = await fetchTasksByDate(dateKey);
   let inserted = 0;
+  const norm = (v) => v || null; // normalize "" / undefined / null → null
   for (const r of matching) {
-    const alreadyExists = existing.some((t) => t.name === r.name && t.project === r.project);
+    const alreadyExists = existing.some((t) => t.name === r.name && norm(t.project) === norm(r.project));
     if (!alreadyExists) {
       await insertTask(dateKey, {
         name: r.name,
-        project: r.project || null,
+        project: norm(r.project),
         estimateSec: r.estimateSec || 1800,
         taskType: "daily",
       });
@@ -674,105 +738,5 @@ export const insertArchived = async (entry) => {
   if (error) console.error("insertArchived:", error);
 };
 
-// ========================
-// Settings
-// ========================
-export const fetchSettings = async () => {
-  const { data, error } = await supabase
-    .from("settings")
-    .select("*")
-    .eq("user_id", USER_ID)
-    .single();
-  if (error) {
-    if (error.code !== "PGRST116") console.error("fetchSettings:", error);
-    return { netlifyUrl: "", gasUrl: "" };
-  }
-  return {
-    netlifyUrl: data.netlify_url || "",
-    gasUrl: data.gas_url || "",
-  };
-};
-
-export const upsertSettings = async (settings) => {
-  const { error } = await supabase
-    .from("settings")
-    .upsert(
-      {
-        user_id: USER_ID,
-        netlify_url: settings.netlifyUrl || null,
-        gas_url: settings.gasUrl || null,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "user_id" }
-    );
-  if (error) console.error("upsertSettings:", error);
-};
-
-// ========================
-// Article Check Results
-// ========================
-export const fetchCheckResults = async (projectName, month) => {
-  let query = supabase
-    .from("article_check_results")
-    .select("*")
-    .eq("user_id", USER_ID);
-  if (projectName) query = query.eq("project_name", projectName);
-  if (month) query = query.eq("month", month);
-  query = query.order("checked_at", { ascending: false });
-  const { data, error } = await query;
-  if (error) {
-    console.error("fetchCheckResults:", error);
-    return [];
-  }
-  return data.map((row) => ({
-    id: row.id,
-    projectName: row.project_name,
-    keyword: row.keyword,
-    title: row.title,
-    docUrl: row.doc_url,
-    month: row.month,
-    articleType: row.article_type,
-    factcheckCritical: row.factcheck_critical,
-    factcheckWarning: row.factcheck_warning,
-    factcheckInfo: row.factcheck_info,
-    factcheckDetail: row.factcheck_detail,
-    finalcheckTypos: row.finalcheck_typos,
-    finalcheckVerdict: row.finalcheck_verdict,
-    finalcheckDetail: row.finalcheck_detail,
-    commentsInserted: row.comments_inserted,
-    status: row.status,
-    errorMessage: row.error_message,
-    checkedAt: row.checked_at,
-  }));
-};
-
-export const fetchCheckResultById = async (id) => {
-  const { data, error } = await supabase
-    .from("article_check_results")
-    .select("*")
-    .eq("id", id)
-    .single();
-  if (error) {
-    console.error("fetchCheckResultById:", error);
-    return null;
-  }
-  return {
-    id: data.id,
-    projectName: data.project_name,
-    keyword: data.keyword,
-    title: data.title,
-    docUrl: data.doc_url,
-    month: data.month,
-    factcheckCritical: data.factcheck_critical,
-    factcheckWarning: data.factcheck_warning,
-    factcheckInfo: data.factcheck_info,
-    factcheckDetail: data.factcheck_detail,
-    finalcheckTypos: data.finalcheck_typos,
-    finalcheckVerdict: data.finalcheck_verdict,
-    finalcheckDetail: data.finalcheck_detail,
-    commentsInserted: data.comments_inserted,
-    status: data.status,
-    errorMessage: data.error_message,
-    checkedAt: data.checked_at,
-  };
-};
+// (settings table removed — netlify/gas urls no longer used)
+// (article_check_results removed — quality check feature dropped)

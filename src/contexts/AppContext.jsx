@@ -1,35 +1,19 @@
 import { createContext, useState, useEffect, useContext, useCallback, useRef } from "react";
-import { AGENTS } from "../lib/constants";
 import {
-  fetchAgentRules,
-  upsertAgentRule,
-  fetchKnowledge,
-  insertKnowledge,
-  deleteKnowledgeById,
-  fetchFeedbacks,
-  insertFeedback,
-  fetchReports,
-  insertReport,
-  deleteReport as deleteReportDb,
   fetchClients,
   upsertClient,
   deleteClient as deleteClientDb,
   fetchProjects,
   upsertProject,
   deleteProject as deleteProjectDb,
-  fetchMsgStyles,
-  saveMsgStylesAll,
-  fetchTemplates,
-  insertTemplate,
-  deleteTemplate as deleteTemplateDb,
   fetchRecurring,
   upsertRecurring,
   deleteRecurring as deleteRecurringDb,
   fetchArchived,
   insertArchived,
-  fetchSettings,
-  upsertSettings,
-  syncProjectTasksToDb,
+  migrateProjectTasksToTable,
+  updateTaskByLinkId,
+  protectProjectsDone,
 } from "../hooks/useStorage";
 
 const AppContext = createContext(null);
@@ -49,29 +33,17 @@ const withRetry = async (fn, maxRetries = 3, baseDelay = 1000) => {
 };
 
 export function AppProvider({ children }) {
-  // Core state (existing)
-  const [agentRules, setAgentRules] = useState({});
-  const [knowledge, setKnowledge] = useState([]);
-  const [feedbacks, setFeedbacks] = useState([]);
-  const [tasks, setTasks] = useState({}); // { [dateKey]: [...tasks] }
+  const [tasks, setTasks] = useState({}); // { [dateKey]: [...tasks] } — in-memory cache
   const [toast, setToast] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [taskRefreshSignal, setTaskRefreshSignal] = useState(0);
   const bumpTaskRefresh = useCallback(() => setTaskRefreshSignal((v) => v + 1), []);
 
-  // v2 state
-  const [reports, setReports] = useState([]);
   const [clients, setClients] = useState([]);
   const [projects, setProjects] = useState([]);
-  const [netlifyUrl, setNetlifyUrl] = useState("");
-  const [gasUrl, setGasUrl] = useState("");
-  const [msgStyles, setMsgStyles] = useState({});
-  const [templates, setTemplates] = useState([]);
   const [archivedTasks, setArchivedTasks] = useState([]);
   const [recurring, setRecurring] = useState([]);
-  const [pendingExec, setPendingExec] = useState(null);
-  const [bgJobLabel, setBgJobLabel] = useState("");
 
   const dataLoaded = useRef(false);
 
@@ -81,39 +53,23 @@ export function AppProvider({ children }) {
     setLoadError(false);
     let pj = [];
     try {
-      const [rules, kn, fb, rpts, cl, projects_, ms, tpl, arch, rec, settings] = await Promise.all([
-        withRetry(fetchAgentRules),
-        withRetry(fetchKnowledge),
-        withRetry(fetchFeedbacks),
-        withRetry(fetchReports).catch(() => []),
+      const [cl, projects_, arch, rec] = await Promise.all([
         withRetry(fetchClients).catch(() => []),
         withRetry(fetchProjects).catch(() => []),
-        withRetry(fetchMsgStyles).catch(() => ({})),
-        withRetry(fetchTemplates).catch(() => []),
         withRetry(fetchArchived).catch(() => []),
         withRetry(fetchRecurring).catch(() => []),
-        withRetry(fetchSettings).catch(() => ({ netlifyUrl: "", gasUrl: "" })),
       ]);
-      pj = projects_;
-      setAgentRules(rules);
-      setKnowledge(kn);
-      setFeedbacks(fb);
-      setReports(rpts);
+      pj = protectProjectsDone(projects_);
       setClients(cl);
       setProjects(pj);
-      setMsgStyles(ms);
-      setTemplates(tpl);
       setArchivedTasks(arch);
       setRecurring(rec);
-      setNetlifyUrl(settings.netlifyUrl);
-      setGasUrl(settings.gasUrl);
       // Verify critical data loaded (projects should not be empty if user has data)
       if (pj.length === 0) {
-        // Double-check: retry projects alone once more
         const retryPj = await withRetry(fetchProjects).catch(() => []);
         if (retryPj.length > 0) {
-          pj = retryPj;
-          setProjects(retryPj);
+          pj = protectProjectsDone(retryPj);
+          setProjects(pj);
         }
       }
     } catch (e) {
@@ -123,63 +79,24 @@ export function AppProvider({ children }) {
     }
     setLoading(false);
     dataLoaded.current = true;
-    // One-time sync: ensure project tasks exist in tasks table
+    // One-time migration: JSONB project tasks → tasks table (runs once per browser)
     if (pj && pj.length > 0) {
-      syncProjectTasksToDb(pj).catch((e) => console.error("Task sync:", e));
+      const migrated = localStorage.getItem("taskMigrationV2Done");
+      if (!migrated) {
+        migrateProjectTasksToTable(pj, upsertProject).then(() => {
+          localStorage.setItem("taskMigrationV2Done", "1");
+          console.log("✅ タスク統一マイグレーション完了");
+        }).catch((e) => console.error("Migration error:", e));
+      }
     }
   }, []);
 
   useEffect(() => { loadAllData(); }, [loadAllData]);
 
-  // ── Agent Rules ──
-  const saveAgentRules = useCallback(
-    async (id, rules) => {
-      const n = { ...agentRules, [id]: rules };
-      setAgentRules(n);
-      await upsertAgentRule(id, rules);
-      setToast("✅ ルール保存");
-    },
-    [agentRules]
-  );
-
-  // ── Knowledge ──
-  const addKnowledge = useCallback(async (item) => {
-    await insertKnowledge(item);
-    const fresh = await fetchKnowledge();
-    setKnowledge(fresh);
-    setToast("✅ ナレッジ追加");
-  }, []);
-
-  const deleteKnowledgeItem = useCallback(async (id) => {
-    await deleteKnowledgeById(id);
-    setKnowledge((prev) => prev.filter((k) => k.id !== id));
-    setToast("🗑 削除");
-  }, []);
-
-  // ── Feedbacks ──
-  const addFeedback = useCallback(async (fb) => {
-    await insertFeedback(fb);
-    const fresh = await fetchFeedbacks();
-    setFeedbacks(fresh);
-  }, []);
-
   // ── Tasks (in-memory + per-item DB sync) ──
   const saveTasks = useCallback(async (t) => {
     if (!dataLoaded.current) return;
     setTasks(t);
-  }, []);
-
-  // ── Reports ──
-  const addReport = useCallback(async (rpt) => {
-    await insertReport(rpt);
-    const fresh = await fetchReports();
-    setReports(fresh);
-  }, []);
-
-  const deleteReportAction = useCallback(async (id) => {
-    await deleteReportDb(id);
-    setReports((prev) => prev.filter((r) => r.id !== id));
-    setToast("🗑 レポート削除");
   }, []);
 
   // ── Clients ──
@@ -194,43 +111,15 @@ export function AppProvider({ children }) {
     setProjects(list);
   }, []);
 
-  // ── Settings (Netlify URL, GAS URL) ──
-  const saveNetlifyUrl = useCallback(async (url) => {
-    setNetlifyUrl(url);
-    await upsertSettings({ netlifyUrl: url, gasUrl });
-    setToast(url ? "✅ Netlify URL保存" : "🗑 Netlify URL削除");
-  }, [gasUrl]);
-
-  const saveGasUrl = useCallback(async (url) => {
-    setGasUrl(url);
-    await upsertSettings({ netlifyUrl, gasUrl: url });
-    setToast(url ? "✅ GAS URL保存" : "🗑 GAS URL削除");
-  }, [netlifyUrl]);
-
-  // ── Message Styles ──
-  const saveMsgStyles = useCallback(async (s) => {
-    setMsgStyles(s);
-    await saveMsgStylesAll(s);
-  }, []);
-
-  // ── Templates ──
-  const addTemplate = useCallback(async (t) => {
-    await insertTemplate(t);
-    const fresh = await fetchTemplates();
-    setTemplates(fresh);
-    setToast("📋 テンプレ保存");
-  }, []);
-
-  const deleteTemplateAction = useCallback(async (id) => {
-    await deleteTemplateDb(id);
-    setTemplates((prev) => prev.filter((t) => t.id !== id));
-    setToast("🗑 テンプレ削除");
-  }, []);
-
   // ── Task Sync (cross-system status propagation) ──
+  // tasks テーブル & projects JSONB の両方を state + Supabase に永続化
   const syncTaskStatus = useCallback(async (linkId, isDone) => {
     if (!linkId) return;
-    // Sync across tasks
+
+    // 1) tasks テーブルを Supabase に永続化
+    await updateTaskByLinkId(linkId, { done: isDone });
+
+    // 2) tasks state を更新（メモリ）
     setTasks((prev) => {
       const next = { ...prev };
       for (const k of Object.keys(next)) {
@@ -242,17 +131,25 @@ export function AppProvider({ children }) {
       }
       return next;
     });
-    // Sync across projects
-    setProjects((prev) =>
-      prev.map((p) => ({
+
+    // 3) projects state を更新 + 該当プロジェクトを Supabase に永続化
+    setProjects((prev) => {
+      const updated = prev.map((p) => ({
         ...p,
         tasks: (p.tasks || []).map((t) =>
           t.linkId === linkId
             ? { ...t, done: isDone, completedAt: isDone ? new Date().toISOString() : null }
             : t
         ),
-      }))
-    );
+      }));
+      for (const p of updated) {
+        if ((p.tasks || []).some((t) => t.linkId === linkId)) {
+          upsertProject(p);
+          break;
+        }
+      }
+      return updated;
+    });
   }, []);
 
   // ── Archive task ──
@@ -266,14 +163,12 @@ export function AppProvider({ children }) {
       completedAt: info.completedAt || new Date().toISOString(),
       result: info.result || "",
     });
-    // Remove from projects
     setProjects((prev) =>
       prev.map((p) => ({
         ...p,
         tasks: (p.tasks || []).filter((t) => t.linkId !== linkId),
       }))
     );
-    // Remove from tasks
     setTasks((prev) => {
       const next = { ...prev };
       for (const k of Object.keys(next)) {
@@ -289,17 +184,6 @@ export function AppProvider({ children }) {
     ]);
     setToast("📦 アーカイブ完了: " + (info.title || "").slice(0, 30));
   }, []);
-
-  // ── Pending execution (task → workspace) ──
-  const handleTaskExecute = useCallback((name, project, batch) => {
-    if (batch) {
-      setPendingExec({ batch });
-    } else {
-      setPendingExec({ name, project });
-    }
-  }, []);
-
-  const clearPendingExec = useCallback(() => setPendingExec(null), []);
 
   // ── Recurring Tasks ──
   const saveRecurring = useCallback(async (item) => {
@@ -317,63 +201,33 @@ export function AppProvider({ children }) {
     <AppContext.Provider
       value={{
         // Core
-        agents: AGENTS,
-        agentRules,
-        knowledge,
-        feedbacks,
         tasks,
         toast,
         loading,
         loadError,
         reloadData: loadAllData,
         setToast,
-        saveAgentRules,
-        addKnowledge,
-        deleteKnowledge: deleteKnowledgeItem,
-        addFeedback,
         saveTasks,
         setTasks,
-        // v2
-        reports,
+        // Domain
         clients,
         projects,
-        netlifyUrl,
-        gasUrl,
-        msgStyles,
-        templates,
         archivedTasks,
         recurring,
         saveRecurring,
         removeRecurring,
-        pendingExec,
-        bgJobLabel,
-        // v2 actions
-        addReport,
-        deleteReport: deleteReportAction,
+        // Actions
         saveClients,
         saveProjects,
-        saveNetlifyUrl,
-        saveGasUrl,
-        saveMsgStyles,
-        addTemplate,
-        deleteTemplate: deleteTemplateAction,
         syncTaskStatus,
         archiveTask,
-        handleTaskExecute,
-        clearPendingExec,
-        setBgJobLabel,
         taskRefreshSignal,
         bumpTaskRefresh,
-        // direct setters for bulk operations (settings import, etc.)
-        setKnowledge,
-        setFeedbacks,
-        setReports,
+        // Direct setters (for migration / bulk import)
         setClients,
         setProjects,
         setArchivedTasks,
         setRecurring,
-        setTemplates,
-        setMsgStyles,
       }}
     >
       {children}

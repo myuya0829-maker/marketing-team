@@ -1,13 +1,9 @@
 import { useState, useRef, useCallback } from "react";
-import { T, getCat } from "../../lib/constants";
-import { truncate, fmtDate, makeStars } from "../../lib/format";
-import { fetchNetlifyIndex } from "../../lib/agents";
+import { T } from "../../lib/constants";
 import { parseExportFile, importToSupabase, CATEGORY_LABELS } from "../../lib/migration";
 import { useApp } from "../../contexts/AppContext";
-import KnowledgeView from "../knowledge/KnowledgeView";
 import Card from "../ui/Card";
 import Btn from "../ui/Btn";
-import AgentAvatar from "../ui/AgentAvatar";
 
 // ── Data Import Panel ──
 function DataImportPanel({ onImportComplete }) {
@@ -83,10 +79,10 @@ function DataImportPanel({ onImportComplete }) {
             </div>
             <div style={{ fontSize: 12, fontWeight: 600, color: T.text, marginBottom: 8 }}>インポート可能:</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
-              {["agents", "knowledge", "feedbacks", "tasks"].map((key) => {
+              {["tasks", "projects"].map((key) => {
                 const count = parsed.stats[key] || 0;
                 const meta = CATEGORY_LABELS[key];
-                if (count === 0) return null;
+                if (count === 0 || !meta) return null;
                 return (
                   <div key={key} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 6, background: `${T.success}10` }}>
                     <span style={{ fontSize: 14 }}>{meta.icon}</span>
@@ -98,11 +94,11 @@ function DataImportPanel({ onImportComplete }) {
             </div>
           </div>
           <div style={{ padding: 10, borderRadius: 6, background: `${T.warning}11`, border: `1px solid ${T.warning}33`, fontSize: 11, color: T.warning, lineHeight: 1.6, marginBottom: 16 }}>
-            ⚠️ 既存データに追加されます（上書きではありません）。エージェントルールのみ同一IDは上書き。
+            ⚠️ 既存データに追加されます（上書きではありません）。
           </div>
           <div style={{ display: "flex", gap: 8 }}>
             <Btn variant="secondary" onClick={reset} style={{ fontSize: 12 }}>キャンセル</Btn>
-            <Btn onClick={handleImport} disabled={["agents", "knowledge", "feedbacks", "tasks"].every((k) => !parsed.stats[k])} style={{ fontSize: 12 }}>インポート実行</Btn>
+            <Btn onClick={handleImport} style={{ fontSize: 12 }}>インポート実行</Btn>
           </div>
         </div>
       )}
@@ -140,155 +136,11 @@ function DataImportPanel({ onImportComplete }) {
 // MAIN SETTINGS VIEW
 // ══════════════════════════════════════════════════════
 export default function SettingsView() {
-  const {
-    agents, agentRules, knowledge, feedbacks,
-    netlifyUrl, gasUrl,
-    saveAgentRules, addKnowledge, deleteKnowledge,
-    saveNetlifyUrl, saveGasUrl, setToast,
-  } = useApp();
-
-  const [editing, setEditing] = useState(null);
-  const [editRules, setEditRules] = useState("");
-  const [editUrl, setEditUrl] = useState(netlifyUrl || "");
-  const [editGasUrl, setEditGasUrl] = useState(gasUrl || "");
-  const [testStatus, setTestStatus] = useState("");
-  const [settingsTab, setSettingsTab] = useState("knowledge");
-
-  // ── Agent editing view ──
-  if (editing) {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        <Btn variant="ghost" onClick={() => setEditing(null)} style={{ alignSelf: "flex-start" }}>← 戻る</Btn>
-        <Card style={{ borderTop: `3px solid ${editing.color}` }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
-            <AgentAvatar agent={editing} size={40} active />
-            <div>
-              <div style={{ fontSize: 16, fontWeight: 600, color: T.text }}>{editing.fullName}</div>
-              <div style={{ fontSize: 12, color: T.textMuted }}>{editing.role}</div>
-            </div>
-          </div>
-          <label style={{ fontSize: 12, fontWeight: 600, color: T.textDim, display: "block", marginBottom: 8 }}>ルール（Markdown）</label>
-          <textarea value={editRules} onChange={(e) => setEditRules(e.target.value)}
-            style={{ width: "100%", minHeight: 300, background: T.bg, color: T.text, border: `1px solid ${T.border}`, borderRadius: T.radiusSm, padding: 14, fontSize: 13, fontFamily: T.font, lineHeight: 1.7, resize: "vertical", outline: "none", boxSizing: "border-box" }} />
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <Btn variant="ghost" onClick={() => setEditRules(editing.defaultRules)}>デフォルト</Btn>
-            <Btn onClick={() => { saveAgentRules(editing.id, editRules); setEditing(null); }}>保存</Btn>
-          </div>
-        </Card>
-      </div>
-    );
-  }
-
-  // ── Main settings view with 3 tabs ──
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ fontSize: 16, fontWeight: 700, color: T.text }}>📚 ナレッジ・設定</div>
+        <div style={{ fontSize: 16, fontWeight: 700, color: T.text }}>⚙️ 設定</div>
       </div>
-
-      {/* Sub-tabs */}
-      <div style={{ display: "flex", gap: 4 }}>
-        {[
-          { id: "knowledge", label: "📚 ナレッジ" },
-          { id: "agents", label: "👥 エージェント" },
-          { id: "connections", label: "🔗 連携" },
-        ].map((st) => (
-          <button key={st.id} onClick={() => setSettingsTab(st.id)} style={{
-            padding: "6px 14px", borderRadius: T.radiusSm,
-            border: `1px solid ${settingsTab === st.id ? T.accent + "44" : T.border}`,
-            background: settingsTab === st.id ? T.accent + "10" : "transparent",
-            color: settingsTab === st.id ? T.accent : T.textMuted,
-            fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: T.font,
-          }}>
-            {st.label}
-          </button>
-        ))}
-      </div>
-
-      {/* Knowledge tab */}
-      {settingsTab === "knowledge" && (
-        <KnowledgeView knowledge={knowledge} onAdd={addKnowledge} onDelete={deleteKnowledge} agents={agents} />
-      )}
-
-      {/* Agents tab */}
-      {settingsTab === "agents" && (
-        <>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 10 }}>
-            {agents.map((agent) => {
-              const custom = agentRules[agent.id] && agentRules[agent.id] !== agent.defaultRules;
-              return (
-                <Card key={agent.id} onClick={() => { setEditing(agent); setEditRules(agentRules[agent.id] || agent.defaultRules); }}
-                  style={{ cursor: "pointer", borderTop: `3px solid ${agent.color}`, padding: "12px 14px" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
-                    <AgentAvatar agent={agent} size={32} active />
-                    <div><div style={{ fontSize: 13, fontWeight: 600, color: T.text }}>{agent.name}</div></div>
-                    {custom && <span style={{ marginLeft: "auto", fontSize: 9, padding: "2px 6px", borderRadius: 4, background: T.accent + "22", color: T.accent }}>カスタム</span>}
-                  </div>
-                  <div style={{ fontSize: 11, color: T.textDim, lineHeight: 1.4 }}>{agent.role}</div>
-                  <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 6 }}>
-                    <span style={{ fontSize: 10, color: T.accent }}>編集 →</span>
-                  </div>
-                </Card>
-              );
-            })}
-          </div>
-
-          {/* Feedback history */}
-          {feedbacks.length > 0 && (
-            <Card>
-              <details>
-                <summary style={{ fontSize: 13, fontWeight: 600, color: T.text, cursor: "pointer" }}>📝 フィードバック履歴（{feedbacks.length}件）</summary>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
-                  {feedbacks.slice(0, 10).map((fb) => (
-                    <div key={fb.id} style={{ padding: "6px 10px", background: T.bg, borderRadius: T.radiusXs, border: `1px solid ${T.border}` }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <span style={{ fontSize: 11, color: T.warning }}>{makeStars(fb.rating)}</span>
-                        <span style={{ fontSize: 11, color: T.text, flex: 1 }}>{fb.task}</span>
-                        <span style={{ fontSize: 9, color: T.textDim }}>{fmtDate(fb.date)}</span>
-                      </div>
-                      {fb.comment && <div style={{ fontSize: 10, color: T.textDim, marginTop: 2 }}>{fb.comment}</div>}
-                    </div>
-                  ))}
-                </div>
-              </details>
-            </Card>
-          )}
-        </>
-      )}
-
-      {/* Connections tab */}
-      {settingsTab === "connections" && (
-        <>
-          <Card style={{ borderTop: `3px solid ${T.cyan}` }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: T.text, marginBottom: 8 }}>📡 外部ナレッジベース（Netlify）</div>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <input value={editUrl} onChange={(e) => { setEditUrl(e.target.value); setTestStatus(""); }} placeholder="https://your-site.netlify.app"
-                style={{ flex: 1, padding: "8px 10px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, outline: "none", fontFamily: T.font }} />
-              <Btn onClick={() => saveNetlifyUrl(editUrl.trim())} style={{ fontSize: 10 }}>保存</Btn>
-              <Btn variant="ghost" onClick={async () => {
-                if (!editUrl.trim()) { setTestStatus("❌ URL未入力"); return; }
-                setTestStatus("🔄 テスト中...");
-                const idx = await fetchNetlifyIndex(editUrl.trim());
-                setTestStatus(idx.length > 0 ? `✅ ${idx.length}件検出` : "⚠️ 未検出");
-              }} style={{ fontSize: 10 }}>テスト</Btn>
-            </div>
-            {testStatus && <div style={{ fontSize: 11, color: testStatus.includes("✅") ? T.success : T.warning, marginTop: 6 }}>{testStatus}</div>}
-            {netlifyUrl && <div style={{ fontSize: 10, color: T.success, marginTop: 4 }}>✅ {netlifyUrl}</div>}
-          </Card>
-
-          <Card style={{ borderTop: "3px solid #F59E0B" }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: T.text, marginBottom: 8 }}>📨 Chatwork送信（GAS連携）</div>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <input value={editGasUrl} onChange={(e) => setEditGasUrl(e.target.value)} placeholder="https://script.google.com/macros/s/xxxxx/exec"
-                style={{ flex: 1, padding: "8px 10px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, outline: "none", fontFamily: T.font }} />
-              <Btn onClick={() => saveGasUrl(editGasUrl.trim())} style={{ fontSize: 10 }}>保存</Btn>
-            </div>
-            {gasUrl && <div style={{ fontSize: 10, color: T.success, marginTop: 4 }}>✅ 設定済み</div>}
-          </Card>
-        </>
-      )}
-
-      {/* Data Import - always visible */}
       <DataImportPanel onImportComplete={() => window.location.reload()} />
     </div>
   );

@@ -1,10 +1,9 @@
-import { useState } from "react";
-import { T, getCat } from "../../lib/constants";
-import { truncate } from "../../lib/format";
+import { useState, useEffect } from "react";
+import { T } from "../../lib/constants";
 import { todayKey } from "../../lib/dates";
-import { dlEnd, dlDisplay, curMonth, monthLabel, prevMonthKey, nextMonthKey, toISO } from "../../lib/dates";
+import { toISO } from "../../lib/dates";
 import { useApp } from "../../contexts/AppContext";
-import { fetchTasksByType, upsertProject, deleteProject as deleteProjectDb } from "../../hooks/useStorage";
+import { fetchTasksByType, fetchTasksByProject, fetchTaskCountsByClient, upsertProject, deleteProject as deleteProjectDb, insertTask as insertTaskDB, updateTask as updateTaskDb, deleteTask as deleteTaskDb } from "../../hooks/useStorage";
 import Card from "../ui/Card";
 import Btn from "../ui/Btn";
 
@@ -15,6 +14,13 @@ const CAT_COLORS = {
   "広告": { color: "#F59E0B", bg: "#F59E0B10", icon: "📢" },
   "LINE": { color: "#06D001", bg: "#06D00110", icon: "💬" },
 };
+const BALL_HOLDERS = [
+  { id: "self", label: "自分", color: "#3B82F6" },
+  { id: "worker", label: "作業者", color: "#22D3EE" },
+  { id: "client", label: "クライアント", color: "#A855F7" },
+  { id: "engineer", label: "エンジニア", color: "#F59E0B" },
+  { id: "designer", label: "デザイナー", color: "#F472B6" },
+];
 const CAT_LIST = [
   { id: "all", label: "すべて", icon: "📋", color: "#9CA3AF" },
   { id: "制作", label: "制作", icon: "🖥️", color: "#3B82F6" },
@@ -124,19 +130,27 @@ function ArchiveExportPanel({ archivedTasks, projectFilter }) {
 // ══════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════
-export default function ClientDashboardView() {
+export default function ClientDashboardView({ initialClientName, onClearInitial }) {
   const {
-    projects, reports, knowledge, archivedTasks,
+    projects, archivedTasks,
     saveProjects, syncTaskStatus, archiveTask, setToast,
   } = useApp();
 
   const [selected, setSelected] = useState(null);
+
+  // Auto-select client when navigated from another view
+  useEffect(() => {
+    if (initialClientName && projects.length > 0) {
+      const match = projects.find((p) => p.name === initialClientName);
+      if (match) setSelected(match.id);
+      if (onClearInitial) onClearInitial();
+    }
+  }, [initialClientName, projects, onClearInitial]);
   const [search, setSearch] = useState("");
   const [catFilter, setCatFilter] = useState("all");
   const [newTask, setNewTask] = useState("");
   const [bulkMode, setBulkMode] = useState(false);
   const [bulkText, setBulkText] = useState("");
-  const [clientArtMonth, setClientArtMonth] = useState(curMonth());
   const [newDeadline, setNewDeadline] = useState("");
   const [newSvc, setNewSvc] = useState("");
   const [svcFilter, setSvcFilter] = useState("");
@@ -147,6 +161,36 @@ export default function ClientDashboardView() {
   const [addingProject, setAddingProject] = useState(false);
   const [newProjName, setNewProjName] = useState("");
   const [newProjSvcs, setNewProjSvcs] = useState(["SEO"]);
+  const [inprogTasks, setInprogTasks] = useState([]);
+  const [clientTasks, setClientTasks] = useState([]);
+  const [clientTasksLoading, setClientTasksLoading] = useState(false);
+  const [taskCounts, setTaskCounts] = useState({});
+
+  // Load task counts from tasks table (source of truth)
+  useEffect(() => {
+    fetchTaskCountsByClient().then(setTaskCounts).catch(() => setTaskCounts({}));
+  }, []);
+
+  // Load in-progress tasks
+  useEffect(() => {
+    fetchTasksByType("inprogress").then(setInprogTasks).catch(() => setInprogTasks([]));
+  }, []);
+
+  // Load tasks from tasks table when a project is selected
+  const sel = selected ? (projects || []).find((p) => p.id === selected) : null;
+  const refreshClientTasks = async (projName) => {
+    if (!projName) { setClientTasks([]); return; }
+    setClientTasksLoading(true);
+    try {
+      const tasks = await fetchTasksByProject(projName);
+      setClientTasks(tasks);
+    } catch { setClientTasks([]); }
+    setClientTasksLoading(false);
+  };
+  useEffect(() => {
+    if (sel) refreshClientTasks(sel.name);
+    else setClientTasks([]);
+  }, [selected, sel?.name]);
 
   const list = projects || [];
 
@@ -172,7 +216,7 @@ export default function ClientDashboardView() {
   // Stats
   const catCounts = {};
   list.forEach((p) => (p.services || [p.category]).forEach((svc) => { catCounts[svc] = (catCounts[svc] || 0) + 1; }));
-  const totalOpen = list.reduce((sum, p) => sum + (p.tasks || []).filter((t) => !t.done).length, 0);
+  const totalOpen = list.reduce((sum, p) => sum + ((taskCounts[p.name] || {}).open || 0), 0);
 
   // ── Update project helper ──
   const updateProject = async (id, updates) => {
@@ -188,61 +232,95 @@ export default function ClientDashboardView() {
     return toISO(v);
   };
 
-  // ── Task actions ──
-  const addTask = () => {
+  // ── Task actions (tasks table = source of truth) ──
+  const addTask = async () => {
     if (!newTask.trim() || !sel) return;
     const lid = "link-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
     const svcs = sel.services || [sel.category];
     const svc = newSvc || svcs[0] || "";
     const dl = parseMmdd(newDeadline);
-    const tasks = (sel.tasks || []).concat([{ id: "t-" + Date.now(), text: newTask.trim(), done: false, date: new Date().toISOString().slice(0, 10), deadline: dl, service: svc, linkId: lid }]);
-    updateProject(sel.id, { tasks });
+    const today = new Date().toISOString().slice(0, 10);
+    await insertTaskDB(today, {
+      name: newTask.trim(),
+      linkId: lid,
+      clientName: sel.name,
+      project: sel.name,
+      deadline: dl || null,
+      service: svc || null,
+      taskType: "daily",
+    });
     setNewTask(""); setNewDeadline("");
+    await refreshClientTasks(sel.name);
+    fetchTaskCountsByClient().then(setTaskCounts).catch(() => {});
     setToast("✅ タスク追加");
   };
 
-  const addBulkTasks = () => {
+  const addBulkTasks = async () => {
     if (!bulkText.trim() || !sel) return;
     const lines = bulkText.split("\n").map((l) => l.replace(/^[\s\-*・●◯◎▶▷►→＞>☐☑✓✔︎\d+.)）]+/, "").trim()).filter((l) => l.length > 0);
     if (lines.length === 0) return;
     const svcs = sel.services || [sel.category];
     const svc = newSvc || svcs[0] || "";
     const dl = parseMmdd(newDeadline);
-    const newTasks = lines.map((l, i) => ({
-      id: "t-" + Date.now() + "-" + i,
-      text: l, done: false, date: new Date().toISOString().slice(0, 10),
-      deadline: dl, service: svc,
-      linkId: "link-" + Date.now() + "-" + i + "-" + Math.random().toString(36).slice(2, 6),
-    }));
-    updateProject(sel.id, { tasks: (sel.tasks || []).concat(newTasks) });
+    const today = new Date().toISOString().slice(0, 10);
+    for (let i = 0; i < lines.length; i++) {
+      const lid = "link-" + Date.now() + "-" + i + "-" + Math.random().toString(36).slice(2, 6);
+      await insertTaskDB(today, {
+        name: lines[i],
+        linkId: lid,
+        clientName: sel.name,
+        project: sel.name,
+        deadline: dl || null,
+        service: svc || null,
+        taskType: "daily",
+      });
+    }
     setBulkText(""); setBulkMode(false); setNewDeadline("");
+    await refreshClientTasks(sel.name);
+    fetchTaskCountsByClient().then(setTaskCounts).catch(() => {});
     setToast(`✅ ${lines.length} 件追加`);
   };
 
-  const toggleTask = (taskId) => {
-    const target = (sel.tasks || []).find((t) => t.id === taskId);
-    const newDone = target ? !target.done : true;
-    const tasks = (sel.tasks || []).map((t) => t.id === taskId ? { ...t, done: newDone, completedAt: newDone ? new Date().toISOString() : null } : t);
-    updateProject(sel.id, { tasks });
-    if (target?.linkId) syncTaskStatus(target.linkId, newDone);
+  const toggleTask = async (taskId) => {
+    const target = clientTasks.find((t) => t.id === taskId);
+    if (!target) return;
+    const newDone = !target.done;
+    const completedAt = newDone ? new Date().toISOString() : null;
+    // Optimistic update (detail view)
+    setClientTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, done: newDone, completedAt } : t));
+    // Persist to tasks table (source of truth)
+    await updateTaskDb(taskId, { done: newDone, completedAt });
+    // Refresh task counts for client cards
+    fetchTaskCountsByClient().then(setTaskCounts).catch(() => {});
+    // Notify other views via in-memory tasks state sync
+    if (target.linkId) syncTaskStatus(target.linkId, newDone);
   };
 
   const archiveTaskAction = (task) => {
     if (!task?.linkId) return;
-    archiveTask(task.linkId, { title: task.text, clientName: sel.name, projectName: sel.name, completedAt: task.completedAt || new Date().toISOString() });
+    archiveTask(task.linkId, { title: task.text, clientName: sel.name, projectName: sel.name, completedAt: new Date().toISOString() });
+    setClientTasks((prev) => prev.filter((t) => t.id !== task.id));
   };
 
-  const deleteTask = (taskId) => {
-    updateProject(sel.id, { tasks: (sel.tasks || []).filter((t) => t.id !== taskId) });
+  const handleDeleteTask = async (taskId) => {
+    setClientTasks((prev) => prev.filter((t) => t.id !== taskId));
+    await deleteTaskDb(taskId);
+    fetchTaskCountsByClient().then(setTaskCounts).catch(() => {});
   };
 
-  const saveEditCT = () => {
+  const saveEditCT = async () => {
     if (!editCT) return;
-    const tasks = (sel.tasks || []).map((t) => {
-      if (t.id !== editCT.id) return t;
-      return { ...t, text: editCT.text, deadline: parseMmdd(editCT.deadline), service: editCT.service, memo: editCT.memo || "" };
+    // Persist to tasks table (source of truth)
+    await updateTaskDb(editCT.id, {
+      name: editCT.text,
+      deadline: parseMmdd(editCT.deadline) || null,
+      service: editCT.service || null,
+      memo: editCT.memo || null,
     });
-    updateProject(sel.id, { tasks });
+    // Optimistic update (detail view)
+    setClientTasks((prev) => prev.map((t) => t.id !== editCT.id ? t : {
+      ...t, text: editCT.text, deadline: parseMmdd(editCT.deadline), service: editCT.service, memo: editCT.memo || "",
+    }));
     setEditCT(null);
     setToast("✅ タスク更新");
   };
@@ -278,23 +356,14 @@ export default function ClientDashboardView() {
     setToast("🗑 案件削除");
   };
 
-  // Related reports/knowledge
-  const getRelated = (name) => ({
-    reports: (reports || []).filter((r) => r.clientName?.toLowerCase() === name.toLowerCase()),
-    knowledge: (knowledge || []).filter((k) => (k.content || "").toLowerCase().includes(name.toLowerCase()) || (k.title || "").toLowerCase().includes(name.toLowerCase())),
-  });
-
-  const sel = selected ? list.find((p) => p.id === selected) : null;
-
   // ══════════════════════════════════════
   // DETAIL VIEW
   // ══════════════════════════════════════
   if (sel) {
     const cc = CAT_COLORS[(sel.services || [sel.category])[0]] || CAT_COLORS["SEO"];
     const svcs = sel.services || [sel.category];
-    const openTasks = (sel.tasks || []).filter((t) => !t.done).sort((a, b) => (a.deadline || "9999") > (b.deadline || "9999") ? 1 : -1);
-    const doneTasks = (sel.tasks || []).filter((t) => t.done);
-    const related = getRelated(sel.name);
+    const openTasks = clientTasks.filter((t) => !t.done).sort((a, b) => (a.deadline || "9999") > (b.deadline || "9999") ? 1 : -1);
+    const doneTasks = clientTasks.filter((t) => t.done);
 
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -359,7 +428,6 @@ export default function ClientDashboardView() {
           {openTasks.length > 0 && <span style={{ color: cc.color, fontWeight: 600 }}>📌 未完了 {openTasks.length}</span>}
           {doneTasks.length > 0 && <span style={{ color: T.success }}>✅ 完了 {doneTasks.length}</span>}
           {(sel.memos || []).length > 0 && <span>📝 メモ {(sel.memos || []).length}</span>}
-          {related.reports.length > 0 && <span>📊 レポート {related.reports.length}</span>}
         </div>
 
         {/* Tasks */}
@@ -400,14 +468,15 @@ export default function ClientDashboardView() {
             ) : (
               <div style={{ display: "flex", gap: 4 }}>
                 <input value={newTask} onChange={(e) => setNewTask(e.target.value)} placeholder="タスクを追加..."
-                  onKeyDown={(e) => { if (e.key === "Enter" && newTask.trim()) addTask(); }}
+                  onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && newTask.trim()) addTask(); }}
                   style={{ flex: 1, minWidth: 120, padding: "6px 10px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, outline: "none", fontFamily: T.font }} />
                 <Btn onClick={addTask} disabled={!newTask.trim()} style={{ fontSize: 10, padding: "4px 10px", background: cc.color, borderColor: cc.color }}>追加</Btn>
               </div>
             )}
           </div>
 
-          {openTasks.length === 0 && doneTasks.length === 0 && <div style={{ textAlign: "center", padding: "8px 0", color: T.textDim, fontSize: 11 }}>タスクなし</div>}
+          {clientTasksLoading && <div style={{ textAlign: "center", padding: "8px 0", color: T.textDim, fontSize: 11 }}>読み込み中...</div>}
+          {!clientTasksLoading && openTasks.length === 0 && doneTasks.length === 0 && <div style={{ textAlign: "center", padding: "8px 0", color: T.textDim, fontSize: 11 }}>タスクなし</div>}
 
           {/* Open tasks */}
           {(svcFilter ? openTasks.filter((t) => t.service === svcFilter) : openTasks).map((t) => {
@@ -438,7 +507,7 @@ export default function ClientDashboardView() {
                         setEditCT({ ...editCT, deadline: v });
                       }} placeholder="MM/DD" style={{ width: 65, padding: "3px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 10, fontFamily: T.font, textAlign: "center" }} />
                       <div style={{ flex: 1 }} />
-                      <button onClick={() => { deleteTask(t.id); setEditCT(null); }} style={{ padding: "2px 6px", borderRadius: T.radiusXs, border: `1px solid ${T.error}33`, background: T.error + "08", color: T.error, fontSize: 9, cursor: "pointer", fontFamily: T.font }}>🗑 削除</button>
+                      <button onClick={() => { handleDeleteTask(t.id); setEditCT(null); }} style={{ padding: "2px 6px", borderRadius: T.radiusXs, border: `1px solid ${T.error}33`, background: T.error + "08", color: T.error, fontSize: 9, cursor: "pointer", fontFamily: T.font }}>🗑 削除</button>
                       <Btn variant="ghost" onClick={() => setEditCT(null)} style={{ fontSize: 9, padding: "2px 6px" }}>取消</Btn>
                       <Btn onClick={saveEditCT} style={{ fontSize: 9, padding: "2px 8px" }}>保存</Btn>
                     </div>
@@ -466,6 +535,27 @@ export default function ClientDashboardView() {
           )}
         </Card>
 
+        {/* In-progress tasks for this client */}
+        {(() => {
+          const clientInprog = inprogTasks.filter(t => t.project === sel.name && !t.done);
+          if (clientInprog.length === 0) return null;
+          return (
+            <Card style={{ borderLeft: `3px solid ${T.cyan}`, padding: 12 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: T.text, marginBottom: 8 }}>🔄 進行中タスク（{clientInprog.length}）</div>
+              {clientInprog.map(t => {
+                const bh = BALL_HOLDERS.find(b => b.id === t.ballHolder) || BALL_HOLDERS[0];
+                return (
+                  <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 0", borderBottom: `1px solid ${T.border}22` }}>
+                    <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 99, background: bh.color + "22", color: bh.color, fontWeight: 600, flexShrink: 0 }}>{bh.label}</span>
+                    <span style={{ flex: 1, fontSize: 11, color: T.text }}>{t.name}</span>
+                    {t.deadline && <span style={{ fontSize: 8, color: t.deadline <= todayKey() ? "#EF4444" : T.textDim }}>{t.deadline.slice(5)}</span>}
+                  </div>
+                );
+              })}
+            </Card>
+          );
+        })()}
+
         {/* Memos */}
         <Card style={{ borderLeft: "3px solid #8B5CF6", padding: 12 }}>
           <div style={{ fontSize: 12, fontWeight: 600, color: T.text, marginBottom: 8 }}>📝 メモ</div>
@@ -486,39 +576,6 @@ export default function ClientDashboardView() {
           ))}
           {(sel.memos || []).length === 0 && <div style={{ textAlign: "center", padding: "12px 0", color: T.textDim, fontSize: 12 }}>メモなし</div>}
         </Card>
-
-        {/* Related Reports */}
-        {related.reports.length > 0 && (
-          <details>
-            <summary style={{ fontSize: 11, fontWeight: 600, color: T.textMuted, cursor: "pointer", padding: "4px 0" }}>📊 レポート（{related.reports.length}）</summary>
-            <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 3 }}>
-              {related.reports.slice(0, 5).map((r) => (
-                <details key={r.id}>
-                  <summary style={{ fontSize: 11, color: T.text, cursor: "pointer", padding: "4px 8px", background: T.bgCard, borderRadius: T.radiusXs, border: `1px solid ${T.border}` }}>
-                    <span style={{ color: T.textDim, marginRight: 6, fontSize: 9 }}>{(r.date || "").slice(0, 10)}</span>
-                    {truncate(r.task || "", 50)}
-                  </summary>
-                  <div style={{ padding: "6px 10px", fontSize: 11, color: T.text, lineHeight: 1.6, whiteSpace: "pre-wrap", maxHeight: 180, overflowY: "auto", borderLeft: `2px solid ${T.accent}`, marginLeft: 6, marginTop: 2 }}>
-                    {r.finalOutput || "(出力なし)"}
-                  </div>
-                </details>
-              ))}
-            </div>
-          </details>
-        )}
-
-        {/* Related Knowledge */}
-        {related.knowledge.length > 0 && (
-          <details>
-            <summary style={{ fontSize: 11, fontWeight: 600, color: T.textMuted, cursor: "pointer", padding: "4px 0" }}>📚 ナレッジ（{related.knowledge.length}）</summary>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 4 }}>
-              {related.knowledge.slice(0, 10).map((k) => {
-                const cat = getCat(k.category);
-                return <span key={k.id} style={{ fontSize: 9, padding: "3px 8px", borderRadius: 99, background: cat.color + "12", color: cat.color }}>{cat.icon} {truncate(k.title, 25)}</span>;
-              })}
-            </div>
-          </details>
-        )}
 
         {/* Archive History */}
         {(() => {
@@ -600,8 +657,9 @@ export default function ClientDashboardView() {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(230px,1fr))", gap: 6 }}>
         {filtered.map((p) => {
           const cc = CAT_COLORS[(p.services || [p.category])[0]] || CAT_COLORS["SEO"];
-          const openCount = (p.tasks || []).filter((t) => !t.done).length;
-          const doneCount = (p.tasks || []).filter((t) => t.done).length;
+          const tc = taskCounts[p.name] || {};
+          const openCount = tc.open || 0;
+          const doneCount = tc.done || 0;
           return (
             <button key={p.id} onClick={() => setSelected(p.id)} style={{ textAlign: "left", padding: "10px 12px", borderRadius: T.radiusSm, border: `1px solid ${cc.color}22`, borderLeft: `3px solid ${cc.color}`, background: T.bgCard, cursor: "pointer", fontFamily: T.font }}>
               <div style={{ fontSize: 12, fontWeight: 600, color: T.text, lineHeight: 1.3, marginBottom: 4 }}>{p.name}</div>

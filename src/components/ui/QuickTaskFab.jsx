@@ -25,6 +25,7 @@ export default function QuickTaskFab() {
     const base = {
       name: name.trim(),
       project: project || null,
+      clientName: project || null,
       deadline: deadline ? toISO(deadline) : null,
       taskType,
       linkId: "link-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
@@ -33,7 +34,9 @@ export default function QuickTaskFab() {
       base.assignee = assignee || null;
       base.status = "pending";
     }
-    await insertTaskDB(todayKey(), base);
+    // deadline が設定されている場合はその日付に、なければ今日に登録
+    const taskDate = deadline ? toISO(deadline) : todayKey();
+    await insertTaskDB(taskDate, base);
     bumpTaskRefresh();
     const typeLabel = TASK_TYPES.find(t => t.id === taskType)?.label || "";
     setToast(`✅ ${typeLabel}タスク追加: ${name.trim()}`);
