@@ -43,6 +43,17 @@ const ART_STEPS = [
 const ART_STEP_IDS = ART_STEPS.map((s) => s.id);
 const ART_DONE_STATUS = "入稿完了";  // 完了扱いするステータス値
 
+// ステータス別の色 (一目で進捗段階が分かるように)
+const ART_STATUS_COLOR = {
+  "構成中":       T.cyan,     // #22D3EE - 作業中
+  "構成完了":     T.warning,  // #F59E0B - 承認待ち
+  "承認済み":     T.purple,   // #A78BFA - 執筆キュー
+  "執筆中":       T.accent,   // #3B82F6 - 執筆中
+  "執筆完了":     "#EC4899",  // pink    - 校正待ち
+  "チェック済み": T.green,    // #4ADE80 - 入稿待ち
+  "入稿完了":     T.success,  // #10B981 - 完了
+};
+
 const BALL_HOLDERS = [
   { id: "self", label: "自分", color: T.accent },
   { id: "worker", label: "作業者", color: T.cyan },
@@ -1850,20 +1861,15 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
       {/* ═══ ARTICLES TAB (コンテンツSEO進捗管理) ═══ */}
       {tmTab === "articles" && (() => {
-        // Phase L+ (2026-04-10): クライアント別サマリビュー
-        // 松下は個別記事制作に関わらないので、純粋な俯瞰ビューとして設計
-        // - 「自分待ち」概念は削除 (意味がない)
-        // - 0 件のステータスは非表示 (ノイズ削減)
+        // Phase L+ (2026-04-10): クライアント別サマリビュー (グリッド + ステータス色分け)
+        // 松下は個別記事制作に関わらない純粋な俯瞰ビュー
         const doneCountTotal = filteredArticles.filter((a) => a.status === ART_DONE_STATUS).length;
         const activeTotal = filteredArticles.length - doneCountTotal;
 
-        // All displayable status steps (進行中 6 段階 + 入稿完了)
-        const ALL_STEPS = [
-          ...ART_STEPS.map((s) => ({ id: s.id, label: s.label, color: T.accent, bg: T.accent + "12" })),
-          { id: ART_DONE_STATUS, label: "入稿完了", color: T.success, bg: T.success + "18" },
-        ];
+        // All status steps with color
+        const ALL_STATUSES = [...ART_STEP_IDS, ART_DONE_STATUS];
 
-        // Group by client (project)
+        // Group by client
         const clientMap = new Map();
         for (const a of filteredArticles) {
           const key = a.project || "(未分類)";
@@ -1879,17 +1885,37 @@ export default function TaskManagementView({ onNavigateToClient }) {
           const activeCount = c.total - doneCount;
           return { ...c, doneCount, activeCount };
         });
-        // 進行中多いクライアント → 完了件数多い順 → 名前順
+        // 進行中多い → 完了多い → 名前順
         clients.sort((a, b) => {
           if (a.activeCount !== b.activeCount) return b.activeCount - a.activeCount;
           if (a.doneCount !== b.doneCount) return b.doneCount - a.doneCount;
           return a.name.localeCompare(b.name);
         });
 
-        // Overall (全クライアント合計) pipeline - 0 件は省く
-        const overallSteps = ALL_STEPS
-          .map((s) => ({ ...s, count: filteredArticles.filter((a) => a.status === s.id).length }))
+        // Overall pipeline (全クライアント合計) - 0件は省く
+        const overallSteps = ALL_STATUSES
+          .map((id) => ({ id, count: filteredArticles.filter((a) => a.status === id).length }))
           .filter((s) => s.count > 0);
+
+        // ステータス chip を描画する共通コンポーネント
+        const StatusChip = ({ statusId, count, size = "sm" }) => {
+          const color = ART_STATUS_COLOR[statusId] || T.textMuted;
+          const isSm = size === "sm";
+          return (
+            <div style={{
+              padding: isSm ? "3px 8px" : "6px 12px",
+              background: color + "1A",
+              borderRadius: isSm ? 4 : 6,
+              display: "inline-flex",
+              alignItems: "baseline",
+              gap: 5,
+              border: `1px solid ${color}44`,
+            }}>
+              <span style={{ fontSize: isSm ? 9 : 10, color, fontWeight: 600, letterSpacing: 0.2 }}>{statusId}</span>
+              <span style={{ fontSize: isSm ? 13 : 16, color, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>{count}</span>
+            </div>
+          );
+        };
 
         return (
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -1911,72 +1937,57 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
           {/* Overall pipeline summary (全クライアント合計) - 0件は省く */}
           {overallSteps.length > 0 && (
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {overallSteps.map((step) => (
-                <div key={step.id} style={{
-                  padding: "8px 14px",
-                  background: step.bg,
-                  borderRadius: 6,
-                  display: "flex",
-                  alignItems: "baseline",
-                  gap: 8,
-                  border: `1px solid ${step.color}22`,
-                }}>
-                  <span style={{ fontSize: 10, color: step.color, fontWeight: 600 }}>{step.label}</span>
-                  <span style={{ fontSize: 16, color: step.color, fontWeight: 700 }}>{step.count}</span>
-                </div>
-              ))}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {overallSteps.map((s) => <StatusChip key={s.id} statusId={s.id} count={s.count} size="lg" />)}
             </div>
           )}
 
-          {/* ── クライアント別サマリ ── */}
-          {clients.length === 0 && (
+          {/* ── クライアント別サマリ (グリッド) ── */}
+          {clients.length === 0 ? (
             <div style={{ textAlign: "center", padding: "20px 0", color: T.textMuted, fontSize: 12 }}>
               この月の記事はありません
             </div>
-          )}
-          {clients.map((c) => {
-            const allDone = c.activeCount === 0 && c.doneCount > 0;
-            // この client で 0 件以外の step のみ
-            const visibleSteps = ALL_STEPS
-              .map((s) => ({ ...s, count: c.statusCounts[s.id] || 0 }))
-              .filter((s) => s.count > 0);
-            return (
-              <Card key={c.name} style={{
-                border: `1px solid ${allDone ? T.success + "33" : T.border}`,
-                opacity: allDone ? 0.75 : 1,
-              }}>
-                {/* Client header row */}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                  <span style={{ fontSize: 14, fontWeight: 600, color: T.text, flex: 1 }}>
-                    {allDone && "✅ "}{c.name}
-                  </span>
-                  <span style={{ fontSize: 11, color: T.textMuted, whiteSpace: "nowrap" }}>
-                    全 {c.total} 本
-                    {c.doneCount > 0 && <span style={{ color: T.success, marginLeft: 6 }}>・完了 {c.doneCount}</span>}
-                  </span>
-                </div>
-
-                {/* Per-client status chips - 0件は省く */}
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {visibleSteps.map((step) => (
-                    <div key={step.id} style={{
-                      padding: "4px 10px",
-                      background: step.bg,
-                      borderRadius: 4,
-                      display: "flex",
-                      alignItems: "baseline",
-                      gap: 6,
-                      border: `1px solid ${step.color}22`,
-                    }}>
-                      <span style={{ fontSize: 9, color: step.color, fontWeight: 600 }}>{step.label}</span>
-                      <span style={{ fontSize: 13, color: step.color, fontWeight: 700 }}>{step.count}</span>
+          ) : (
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
+              gap: 10,
+            }}>
+              {clients.map((c) => {
+                const allDone = c.activeCount === 0 && c.doneCount > 0;
+                const visibleSteps = ALL_STATUSES
+                  .map((id) => ({ id, count: c.statusCounts[id] || 0 }))
+                  .filter((s) => s.count > 0);
+                return (
+                  <div key={c.name} style={{
+                    padding: 12,
+                    borderRadius: T.radiusSm,
+                    background: T.bgCard,
+                    border: `1px solid ${allDone ? T.success + "33" : T.border}`,
+                    opacity: allDone ? 0.7 : 1,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 8,
+                  }}>
+                    {/* Client header */}
+                    <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 6 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {allDone && "✅ "}{c.name}
+                      </span>
+                      <span style={{ fontSize: 11, color: T.textMuted, whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
+                        {c.total}本
+                      </span>
                     </div>
-                  ))}
-                </div>
-              </Card>
-            );
-          })}
+
+                    {/* Status chips */}
+                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                      {visibleSteps.map((s) => <StatusChip key={s.id} statusId={s.id} count={s.count} size="sm" />)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
           {/* シート由来 (view-only) */}
           <div style={{ fontSize: 10, color: T.textMuted, textAlign: "center", marginTop: 8, padding: "8px 0", borderTop: `1px dashed ${T.border}` }}>
