@@ -779,10 +779,10 @@ export default function TaskManagementView({ onNavigateToClient }) {
   // ── Article CRUD removed (Phase K, 2026-04-10): 記事は記事管理シートが真実 ──
 
   // ── Report stage toggle (Phase L) ──
-  // 4 ステージ (データ取得 / レポート生成 / レビュー / 送信) を Stack で更新
-  // 注: ここで更新しても sync-stack.py 次回実行で sheet 値で上書きされる可能性あり
-  // → done のみ一方向アップグレード保護されている (build_report_update_body)
-  // ステージ状態自体は EOD writeback でシートに反映する運用
+  // 3 ステージ (データ取得 / レポート生成 / 送信) を Stack で更新
+  // 注: sync-stack.py の REPORT_DIFF_FIELDS から stage 列を除外しているので
+  //     Stack 値が次回 sync (5 分ごと) で sheet 値に巻き戻されることはない。
+  //     さらに --writeback フラグで Stack の stage 値を sheet 側にも逆同期している。
   const toggleReportStage = async (id, stageField) => {
     const rep = reports.find((r) => r.id === id);
     if (!rep) return;
@@ -816,7 +816,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
   // task_type ごとに編集可能範囲が違うのでバッジを出し分ける:
   //   - daily/inprogress/delegation : シートが真実 / done・ball・タイマーは Stack 操作可 → 🔒
   //   - article                     : シートが真実 / Stack は完全 view-only       → 👁
-  //   - report                      : Stack が編集の主役 / シートには EOD writeback → ✏️
+  //   - report                      : Stack が編集の主役 / 5 分ごとにシートへ writeback → ✏️
   const SheetLockBadge = ({ task }) => {
     if (!task || !task.sheetKey) return null;
     const tt = task.task_type || task.taskType;
@@ -829,7 +829,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
       color = T.textMuted;
     } else if (tt === "report") {
       icon = "✏️";
-      title = "📊 レポート管理シート由来 (Stack 編集可)\n・データ取得 / レポート生成 / 送信 のステージは Stack で更新できます\n・更新内容は EOD writeback でシートに反映されます";
+      title = "📊 レポート管理シート由来 (Stack 編集可)\n・データ取得 / レポート生成 / 送信 のステージは Stack で更新できます\n・更新内容は 5 分ごとの自動同期でシートにも反映されます";
       color = T.warning;
     }
     return (
@@ -2094,7 +2094,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
           })}
 
           <div style={{ fontSize: 10, color: T.textMuted, textAlign: "center", marginTop: 8, padding: "8px 0", borderTop: `1px dashed ${T.border}` }}>
-            ⚠️ ステージ更新は Stack 内で完結 (シート反映は EOD writeback で実施)
+            ✏️ Stack でステージを更新 → 5 分ごとに自動でシートへ反映
           </div>
         </div>
         );
