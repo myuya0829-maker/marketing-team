@@ -811,22 +811,37 @@ export default function TaskManagementView({ onNavigateToClient }) {
   const delegStatusColor = (s) => ({ pending: T.textMuted, inprogress: T.accent, waiting: T.warning, done: T.success }[s] || T.textMuted);
   const getBallHolder = (id) => BALL_HOLDERS.find((b) => b.id === id) || BALL_HOLDERS[0];
 
-  // ── Sheet-sourced task indicator (Phase J-5d) ──
-  // sheet_key != null のタスクは「施策管理シート」由来。
-  // done/ball サイクル/サブタスク/タイマーは Stack で自由に操作できるが、
-  // 名前・期限・案件・担当者はシートが真実で、編集しても次回 sync で上書きされる。
+  // ── Sheet-sourced task indicator (Phase J-5d / K+L) ──
+  // sheet_key != null のタスクは「施策管理シート / 記事管理シート / レポート管理シート」由来。
+  // task_type ごとに編集可能範囲が違うのでバッジを出し分ける:
+  //   - daily/inprogress/delegation : シートが真実 / done・ball・タイマーは Stack 操作可 → 🔒
+  //   - article                     : シートが真実 / Stack は完全 view-only       → 👁
+  //   - report                      : Stack が編集の主役 / シートには EOD writeback → ✏️
   const SheetLockBadge = ({ task }) => {
     if (!task || !task.sheetKey) return null;
+    const tt = task.task_type || task.taskType;
+    let icon = "🔒";
+    let title = "📚 施策管理シート由来のタスクです\n・完了チェック / ボール保持者 / サブタスク / タイマーは Stack で操作できます\n・タスク名 / 期限 / 案件 / 担当者 はシートで編集してください（Stack で変更しても次回 sync で上書きされます）";
+    let color = T.cyan;
+    if (tt === "article") {
+      icon = "👁";
+      title = "📝 記事管理シート由来 (view-only)\n・山岸チームの進捗を Stack で監視するためのタスクです\n・全フィールドはシート側で編集してください（Stack では変更できません）";
+      color = T.textMuted;
+    } else if (tt === "report") {
+      icon = "✏️";
+      title = "📊 レポート管理シート由来 (Stack 編集可)\n・データ取得 / レポート生成 / 送信 のステージは Stack で更新できます\n・更新内容は EOD writeback でシートに反映されます";
+      color = T.warning;
+    }
     return (
       <span
-        title="📚 施策管理シート由来のタスクです&#10;・完了チェック / ボール保持者 / サブタスク / タイマーは Stack で操作できます&#10;・タスク名 / 期限 / 案件 / 担当者 はシートで編集してください（Stack で変更しても次回 sync で上書きされます）"
+        title={title}
         style={{
           display: "inline-flex", alignItems: "center", justifyContent: "center",
           fontSize: 9, flexShrink: 0, opacity: 0.75, cursor: "help",
-          color: T.cyan,
+          color,
         }}
       >
-        🔒
+        {icon}
       </span>
     );
   };
