@@ -1998,7 +1998,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
           {/* シート由来 (view-only) なので追加 UI なし */}
           <div style={{ fontSize: 10, color: T.textMuted, textAlign: "center", marginTop: 8, padding: "8px 0", borderTop: `1px dashed ${T.border}` }}>
-            🔒 記事管理シートが真実 (Stack では編集不可)
+            👁 記事管理シートが真実 (Stack は山岸チームの進捗を監視するだけ)
           </div>
         </div>
         );
