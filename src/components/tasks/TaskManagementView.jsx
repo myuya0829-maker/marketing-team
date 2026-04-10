@@ -323,11 +323,15 @@ export default function TaskManagementView({ onNavigateToClient }) {
   // Split project tasks: regular (default) vs inprog
   // 進行中タスクは「期限が閲覧日」or「期限切れ（overdue）」のものだけ today タブに表示
   // 過去日を閲覧時: 未完了の繰越タスクは「今日」に表示されるため非表示
+  // 未来日を閲覧時: 未完了の繰越タスクは日付が変わるまで非表示 (明示的にその日が deadline のもののみ表示)
   const regularProjTasks = useMemo(() => {
     const today = todayKey();
     return extraProjTasks.filter(t => {
       // 過去日: 未完了の繰越タスクは今日に移動済みなので非表示
       if (date < today && !t.done) return false;
+      // 未来日: 未完了の繰越タスクは非表示。実際にその日になってから carryover として表示する。
+      // ただし deadline がその日ちょうどのタスクは「明示的にその日を指定した」ものなので表示する。
+      if (date > today && !t.done && (!t.deadline || dl(t.deadline) !== date)) return false;
       return t.taskType !== "inprogress" || (t.deadline && (dl(t.deadline) === date || t._isOverdue));
     });
   }, [extraProjTasks, date]);
