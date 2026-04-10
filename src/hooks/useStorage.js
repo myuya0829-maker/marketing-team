@@ -81,6 +81,27 @@ export const fetchTasksByType = async (taskType) => {
 };
 
 /**
+ * Fetch the most recent sheet_synced_at timestamp across all sheet-sourced tasks.
+ * Phase J-1 以降、シート由来行は task_type='daily'|'inprogress'|'delegation'|'sheet_orphan' に
+ * 分散するため、sheet_key IS NOT NULL でフィルタする。
+ * UI のラストシンクバッジ表示用 (Phase J-6)。
+ */
+export const fetchLastSheetSyncAt = async () => {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("sheet_synced_at")
+    .eq("user_id", USER_ID)
+    .not("sheet_key", "is", null)
+    .order("sheet_synced_at", { ascending: false, nullsFirst: false })
+    .limit(1);
+  if (error) {
+    console.error("fetchLastSheetSyncAt:", error);
+    return null;
+  }
+  return data && data[0] ? data[0].sheet_synced_at : null;
+};
+
+/**
  * Fetch tasks for a specific project/client (for ClientDashboardView).
  * Returns in JSONB-compatible format (text, service, linkId, etc.)
  */
@@ -245,6 +266,11 @@ const mapTaskRow = (row) => ({
   month: row.month,
   taskDate: row.task_date,
   completedAt: row.completed_at || null,
+  // Sheet-sourced task metadata (Phase J-5)
+  sheetKey: row.sheet_key || null,
+  sheetSyncedAt: row.sheet_synced_at || null,
+  sheetCategory: row.sheet_category || null,
+  sheetPriority: row.sheet_priority || null,
 });
 
 export const insertTask = async (dateKey, task) => {

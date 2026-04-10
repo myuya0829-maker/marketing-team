@@ -59,6 +59,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
   // (localStorage doneIds cleanup removed — tasks table is source of truth)
 
   const [tmTab, setTmTab] = useState("today");
+  const [inprogFilter, setInprogFilter] = useState("all"); // "all" | "self" | "other"
   const [date, setDate] = useState(todayKey());
   const [dayTasks, setDayTasks] = useState([]);
   const [delegations, setDelegations] = useState([]);
@@ -687,15 +688,30 @@ export default function TaskManagementView({ onNavigateToClient }) {
   };
 
   const cycleDelegStatus = async (id) => {
-    const cycle = ["pending", "inprogress", "waiting", "done"];
+    // done は cycle から除外 (意図しない完了を防ぐ)。完了は別ボタンで明示的に。
+    const cycle = ["pending", "inprogress", "waiting"];
     const task = delegations.find((d) => d.id === id);
     if (!task) return;
-    const idx = cycle.indexOf(task.status || "pending");
-    const next = cycle[(idx + 1) % cycle.length];
-    const updates = { status: next, done: next === "done" };
+    // 既知の status でなければ pending から開始
+    const cur = cycle.indexOf(task.status || "pending");
+    const next = cycle[(cur === -1 ? 0 : (cur + 1) % cycle.length)];
+    const updates = { status: next };
     setDelegations((prev) => prev.map((d) => (d.id === id ? { ...d, ...updates } : d)));
     await updateTaskDB(id, updates);
-    if (task.linkId) syncTaskStatus(task.linkId, next === "done");
+  };
+
+  // 依頼タスクの完了トグル (inprogress と同じパターン)
+  const toggleDelegDone = async (id) => {
+    const task = delegations.find((d) => d.id === id);
+    if (!task) return;
+    const nextDone = !task.done;
+    const updates = {
+      done: nextDone,
+      completedAt: nextDone ? new Date().toISOString() : null,
+    };
+    setDelegations((prev) => prev.map((d) => (d.id === id ? { ...d, done: nextDone, completedAt: updates.completedAt } : d)));
+    await updateTaskDB(id, updates);
+    if (task.linkId) syncTaskStatus(task.linkId, nextDone);
   };
 
   const deleteDelegTask = async (id) => {
@@ -803,6 +819,26 @@ export default function TaskManagementView({ onNavigateToClient }) {
   const delegStatusColor = (s) => ({ pending: T.textMuted, inprogress: T.accent, waiting: T.warning, done: T.success }[s] || T.textMuted);
   const getBallHolder = (id) => BALL_HOLDERS.find((b) => b.id === id) || BALL_HOLDERS[0];
 
+  // ── Sheet-sourced task indicator (Phase J-5d) ──
+  // sheet_key != null のタスクは「施策管理シート」由来。
+  // done/ball サイクル/サブタスク/タイマーは Stack で自由に操作できるが、
+  // 名前・期限・案件・担当者はシートが真実で、編集しても次回 sync で上書きされる。
+  const SheetLockBadge = ({ task }) => {
+    if (!task || !task.sheetKey) return null;
+    return (
+      <span
+        title="📚 施策管理シート由来のタスクです&#10;・完了チェック / ボール保持者 / サブタスク / タイマーは Stack で操作できます&#10;・タスク名 / 期限 / 案件 / 担当者 はシートで編集してください（Stack で変更しても次回 sync で上書きされます）"
+        style={{
+          display: "inline-flex", alignItems: "center", justifyContent: "center",
+          fontSize: 9, flexShrink: 0, opacity: 0.75, cursor: "help",
+          color: T.cyan,
+        }}
+      >
+        🔒
+      </span>
+    );
+  };
+
   // ═══════════════════════════════════════
   // RENDER
   // ═══════════════════════════════════════
@@ -815,8 +851,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
           {[
             { id: "today", label: "📅 今日" },
             { id: "list", label: "📋 一覧" },
-            { id: "inprog", label: "🔄 進行中", badge: inprogress.filter((t) => !t.done).length },
-            { id: "deleg", label: "👥 依頼", badge: pendingDelegCount },
+            { id: "inprog", label: "🔄 進行中", badge: inprogress.filter((t) => !t.done).length + pendingDelegCount },
             { id: "monthly", label: "📆 月次", badge: recurring.length },
             { id: "articles", label: "📝 コンテンツSEO", badge: articles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length },
             { id: "completed", label: "✅ 完了" },
@@ -1018,6 +1053,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
                     <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                       {task.status === "inprog_child" && (() => { const tbh = getBallHolder(task.ballHolder); return (<button onClick={async () => { const curIdx = BALL_HOLDERS.findIndex((b) => b.id === (task.ballHolder || "self")); const nextBall = BALL_HOLDERS[(curIdx + 1) % BALL_HOLDERS.length].id; setDayTasks((prev) => prev.map((dt) => dt.id === task.id ? { ...dt, ballHolder: nextBall } : dt)); await updateTaskDB(task.id, { ballHolder: nextBall }); }} style={{ fontSize: 8, padding: "2px 6px", borderRadius: 99, background: tbh.color + "22", color: tbh.color, border: `1px solid ${tbh.color}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600, flexShrink: 0 }}>{tbh.label}</button>); })()}
                       {task.project && <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: T.accent + "15", color: T.accent }}>{truncate(task.project, 12)}</span>}
+                      <SheetLockBadge task={task} />
                       <span style={{ fontSize: 13, fontWeight: 500, color: task.done ? T.textMuted : T.text, textDecoration: task.done ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{task.name}</span>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
@@ -1263,6 +1299,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
                       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px" }}>
                         <button onClick={() => updateInprogBall(t.id, BALL_HOLDERS[(BALL_HOLDERS.findIndex((b) => b.id === t.ballHolder) + 1) % BALL_HOLDERS.length].id)} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 99, background: bh.color + "22", color: bh.color, border: `1px solid ${bh.color}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600, flexShrink: 0 }}>{bh.label}</button>
                         {t.project && <button onClick={() => onNavigateToClient && onNavigateToClient(t.project)} style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: T.cyan + "20", color: T.cyan, border: `1px solid ${T.cyan}33`, cursor: "pointer", fontFamily: T.font, flexShrink: 0 }}>{truncate(t.project, 12)}</button>}
+                        <SheetLockBadge task={t} />
                         <span style={{ flex: 1, fontSize: 13, fontWeight: 500, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</span>
                         {renderDeadline(t.id, t.deadline, { prefix: "", fontSize: 10, showEmpty: true, overrideColor: dl(t.deadline) < todayKey() ? T.error : T.textMuted, afterSave: async (id, iso) => { setInprogress((prev) => prev.map((x) => x.id === id ? { ...x, deadline: iso } : x)); await updateTaskDB(id, { deadline: iso }); } })}
                         <button onClick={() => { setAddingFromInprog(addingFromInprog === t.id ? null : t.id); setFromInprogName(""); }} title="自分タスクを追加" style={{ width: 24, height: 24, borderRadius: "50%", border: `1px solid ${T.accent}44`, background: addingFromInprog === t.id ? T.accent + "22" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: T.accent, flexShrink: 0 }}>+</button>
@@ -1478,6 +1515,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
                         <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: `1px solid ${T.border}11` }}>
                           <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 99, background: bh.color + "22", color: bh.color, fontWeight: 600, flexShrink: 0 }}>{bh.label}</span>
                           {t.project && <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: T.cyan + "15", color: T.cyan, flexShrink: 0 }}>{truncate(t.project, 12)}</span>}
+                          <SheetLockBadge task={t} />
                           <span style={{ flex: 1, fontSize: 13, fontWeight: 500, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</span>
                           {subs.length > 0 && <span style={{ fontSize: 9, color: T.textMuted }}>{subDone}/{subs.length}</span>}
                           {t.deadline && <span style={{ fontSize: 10, color: dl(t.deadline) < todayKey() ? T.error : T.textMuted }}>{dl(t.deadline).slice(5, 10).replace("-", "/")}</span>}
@@ -1503,18 +1541,19 @@ export default function TaskManagementView({ onNavigateToClient }) {
                       <span style={{ fontSize: 15, fontWeight: 700, color: T.text }}>📮 依頼中タスク</span>
                       <span style={{ fontSize: 11, padding: "2px 10px", borderRadius: 99, background: T.warning + "18", color: T.warning, fontWeight: 600 }}>{activeDel.length}</span>
                     </div>
-                    <button onClick={() => setTmTab("deleg")} style={{ padding: "4px 12px", borderRadius: 6, border: `1px solid ${T.border}`, background: T.bgCard, color: T.text, fontSize: 11, cursor: "pointer", fontFamily: T.font }}>詳細 →</button>
+                    <button onClick={() => { setInprogFilter("other"); setTmTab("inprog"); }} style={{ padding: "4px 12px", borderRadius: 6, border: `1px solid ${T.border}`, background: T.bgCard, color: T.text, fontSize: 11, cursor: "pointer", fontFamily: T.font }}>詳細 →</button>
                   </div>
                   <div style={{ padding: "0 14px 10px", display: "flex", flexDirection: "column", gap: 2 }}>
                     {preview.map((d) => (
                       <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: `1px solid ${T.border}11` }}>
                         <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: delegStatusColor(d.status) + "22", color: delegStatusColor(d.status), fontWeight: 600, flexShrink: 0 }}>{delegStatusLabel(d.status)}</span>
+                        <SheetLockBadge task={d} />
                         <span style={{ flex: 1, fontSize: 13, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.name}</span>
                         {d.assignee && <span style={{ fontSize: 10, color: T.purple }}>→ {d.assignee}</span>}
                         {d.deadline && <span style={{ fontSize: 10, color: dl(d.deadline) < todayKey() ? T.error : T.textMuted }}>{dl(d.deadline).slice(5, 10).replace("-", "/")}</span>}
                       </div>
                     ))}
-                    {rest > 0 && <div style={{ padding: "6px 0", fontSize: 11, color: T.warning, cursor: "pointer" }} onClick={() => setTmTab("deleg")}>他 {rest} 件を表示...</div>}
+                    {rest > 0 && <div style={{ padding: "6px 0", fontSize: 11, color: T.warning, cursor: "pointer" }} onClick={() => { setInprogFilter("other"); setTmTab("inprog"); }}>他 {rest} 件を表示...</div>}
                   </div>
                 </Card>
               );
@@ -1523,18 +1562,44 @@ export default function TaskManagementView({ onNavigateToClient }) {
         );
       })()}
 
-      {/* ═══ IN-PROGRESS TAB ═══ */}
-      {tmTab === "inprog" && (
+      {/* ═══ IN-PROGRESS TAB (進行中 + 依頼 merged) ═══ */}
+      {tmTab === "inprog" && (() => {
+        const activeInprog = inprogress.filter((t) => !t.done);
+        const activeDeleg = delegations.filter((d) => !d.done && d.status !== "done");
+        const selfInprog = activeInprog.filter((t) => (t.ballHolder || "self") === "self");
+        const otherInprog = activeInprog.filter((t) => (t.ballHolder || "self") !== "self");
+        const selfCount = selfInprog.length;
+        const otherCount = otherInprog.length + activeDeleg.length;
+        const showInprog = inprogFilter === "all" ? activeInprog : (inprogFilter === "self" ? selfInprog : otherInprog);
+        const showDeleg = inprogFilter === "self" ? [] : activeDeleg;
+        return (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ fontSize: 15, fontWeight: 700, color: T.text }}>🔄 進行中タスク</span>
-              <span style={{ fontSize: 12, color: T.textMuted }}>{inprogress.filter(t => !t.done).length} 件</span>
+              <span style={{ fontSize: 12, color: T.textMuted }}>{activeInprog.length + activeDeleg.length} 件</span>
             </div>
-            <Btn variant="secondary" onClick={() => setAddingInprog(true)} style={{ fontSize: 11, padding: "4px 12px" }}>+ 追加</Btn>
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              {[
+                { id: "all", label: "全て", count: selfCount + otherCount },
+                { id: "self", label: "🏀 自分ボール", count: selfCount },
+                { id: "other", label: "👥 他人ボール", count: otherCount },
+              ].map((f) => (
+                <button key={f.id} onClick={() => setInprogFilter(f.id)} style={{
+                  padding: "4px 10px", fontSize: 10, fontWeight: inprogFilter === f.id ? 600 : 400,
+                  color: inprogFilter === f.id ? T.accent : T.textMuted,
+                  background: inprogFilter === f.id ? T.accent + "18" : "transparent",
+                  border: `1px solid ${inprogFilter === f.id ? T.accent + "44" : T.border}`,
+                  borderRadius: 99, cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap",
+                }}>
+                  {f.label} <span style={{ opacity: 0.7 }}>{f.count}</span>
+                </button>
+              ))}
+              <Btn variant="secondary" onClick={() => setAddingInprog(true)} style={{ fontSize: 11, padding: "4px 12px" }}>+ 追加</Btn>
+            </div>
           </div>
           {/* Active tasks */}
-          {inprogress.filter(t => !t.done).map((task) => {
+          {showInprog.map((task) => {
             const bh = getBallHolder(task.ballHolder);
             const subs = task.subtasks || [];
             const subDone = subs.filter((s) => s.done).length;
@@ -1545,6 +1610,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
                     <button onClick={() => toggleInprogDone(task.id)} title="完了（アーカイブ）" style={{ width: 22, height: 22, borderRadius: "50%", border: `2px solid ${T.border}`, background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: T.success, flexShrink: 0 }} />
                     <button onClick={() => updateInprogBall(task.id, BALL_HOLDERS[(BALL_HOLDERS.findIndex((b) => b.id === task.ballHolder) + 1) % BALL_HOLDERS.length].id)} style={{ fontSize: 10, padding: "3px 10px", borderRadius: 99, background: bh.color + "22", color: bh.color, border: `1px solid ${bh.color}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600 }}>{bh.label}</button>
                     {task.project && <button onClick={() => onNavigateToClient && onNavigateToClient(task.project)} style={{ fontSize: 10, color: T.cyan, background: "none", border: `1px solid ${T.cyan}33`, borderRadius: 4, padding: "2px 8px", cursor: "pointer", fontFamily: T.font, fontWeight: 500 }}>{truncate(task.project, 15)}</button>}
+                    <SheetLockBadge task={task} />
                     <span style={{ fontSize: 15, fontWeight: 600, color: T.text, flex: 1 }}>{task.name}</span>
                     {subs.length > 0 && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: T.bgCard, color: T.textMuted, fontWeight: 600 }}>{subDone}/{subs.length}</span>}
                     <button onClick={() => setEditingTask(editingTask?.id === task.id ? null : { id: task.id, name: task.name, project: task.project || "", ballHolder: task.ballHolder || "self", deadline: task.deadline ? task.deadline.slice(5, 10).replace(/-/g, "/") : "", memo: task.memo || "", _isInprog: true })} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: T.textDim }}>✏️</button>
@@ -1656,28 +1722,45 @@ export default function TaskManagementView({ onNavigateToClient }) {
               </div>
             </Card>
           )}
-        </div>
-      )}
 
-      {/* ═══ DELEGATION TAB ═══ */}
-      {tmTab === "deleg" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {delegations.map((d) => (
-            <Card key={d.id} style={{ border: `1px solid ${delegStatusColor(d.status)}33`, opacity: d.done ? 0.5 : 1 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <button onClick={() => cycleDelegStatus(d.id)} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 99, background: delegStatusColor(d.status) + "22", color: delegStatusColor(d.status), border: `1px solid ${delegStatusColor(d.status)}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600, whiteSpace: "nowrap" }}>{delegStatusLabel(d.status)}</button>
-                {d.project && <span style={{ fontSize: 9, color: T.textMuted }}>[{truncate(d.project, 12)}]</span>}
-                <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>{d.name}</span>
-                {d.assignee && <span style={{ fontSize: 10, color: T.purple }}>→ {d.assignee}</span>}
-                {renderDeadline(d.id, d.deadline, { afterSave: async (id, iso) => { setDelegations((prev) => prev.map((t) => t.id === id ? { ...t, deadline: iso } : t)); await updateTaskDB(id, { deadline: iso }); } })}
-                <button onClick={() => deleteDelegTask(d.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
+          {/* ── 依頼中タスク（delegation） ── */}
+          {showDeleg.length > 0 && (
+            <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+                <span style={{ fontSize: 13, fontWeight: 600, color: T.textMuted }}>📮 依頼中</span>
+                <span style={{ fontSize: 11, color: T.textMuted }}>{showDeleg.length} 件</span>
               </div>
-              {d.memo && <div style={{ marginTop: 4, fontSize: 11, color: T.textDim, paddingLeft: 8 }}>📝 {d.memo}</div>}
-            </Card>
-          ))}
+              {showDeleg.map((d) => {
+                // ball_holder: フリーテキスト (SEO / エンジニア / デザイナー / 藤田等) を受け入れる
+                const rawBall = (d.ballHolder || d.assignee || "").trim();
+                // 色は BALL_HOLDERS から一致するものを優先、なければ purple (delegation デフォルト)
+                const matchedBh = BALL_HOLDERS.find((b) => b.id === rawBall || b.label.includes(rawBall));
+                const ballColor = matchedBh ? matchedBh.color : T.purple;
+                const ballLabel = rawBall || "未割当";
+                return (
+                <Card key={d.id} style={{ border: `1px solid ${ballColor}33`, borderLeft: `3px solid ${ballColor}`, opacity: d.done ? 0.5 : 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    {/* 完了チェックボタン */}
+                    <button onClick={() => toggleDelegDone(d.id)} title={d.done ? "未完了に戻す" : "完了"} style={{ width: 22, height: 22, borderRadius: "50%", border: `2px solid ${d.done ? T.success : T.border}`, background: d.done ? T.success + "22" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: T.success, flexShrink: 0 }}>{d.done ? "✓" : ""}</button>
+                    {/* ステータスサイクル (pending/inprogress/waiting のみ) */}
+                    <button onClick={() => cycleDelegStatus(d.id)} title="ステータスをサイクル (未着手→進行中→待ち)" style={{ fontSize: 9, padding: "2px 8px", borderRadius: 99, background: delegStatusColor(d.status) + "22", color: delegStatusColor(d.status), border: `1px solid ${delegStatusColor(d.status)}44`, cursor: "pointer", fontFamily: T.font, fontWeight: 600, whiteSpace: "nowrap", flexShrink: 0 }}>{delegStatusLabel(d.status)}</button>
+                    {/* ボール保持者バッジ */}
+                    <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, background: ballColor + "22", color: ballColor, border: `1px solid ${ballColor}44`, fontWeight: 600, whiteSpace: "nowrap", flexShrink: 0 }} title="ボール保持者（依頼先）">→ {ballLabel}</span>
+                    {d.project && <button onClick={() => onNavigateToClient && onNavigateToClient(d.project)} style={{ fontSize: 10, color: T.cyan, background: "none", border: `1px solid ${T.cyan}33`, borderRadius: 4, padding: "2px 8px", cursor: "pointer", fontFamily: T.font, fontWeight: 500 }}>{truncate(d.project, 15)}</button>}
+                    <SheetLockBadge task={d} />
+                    <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1, textDecoration: d.done ? "line-through" : "none" }}>{d.name}</span>
+                    {renderDeadline(d.id, d.deadline, { afterSave: async (id, iso) => { setDelegations((prev) => prev.map((t) => t.id === id ? { ...t, deadline: iso } : t)); await updateTaskDB(id, { deadline: iso }); } })}
+                    <button onClick={() => deleteDelegTask(d.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
+                  </div>
+                  {d.memo && <div style={{ marginTop: 4, fontSize: 11, color: T.textDim, paddingLeft: 30 }}>📝 {d.memo}</div>}
+                </Card>
+                );
+              })}
+            </div>
+          )}
 
           {/* Add delegation */}
-          {addingDeleg ? (
+          {inprogFilter !== "self" && (addingDeleg ? (
             <Card style={{ border: `1px solid ${T.purple}33` }}>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
                 <input value={delegName} onChange={(e) => setDelegName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) addDelegTask(); }} autoFocus placeholder="依頼内容..." style={{ flex: 1, minWidth: 140, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} />
@@ -1693,10 +1776,11 @@ export default function TaskManagementView({ onNavigateToClient }) {
               <textarea value={delegMemo} onChange={(e) => setDelegMemo(e.target.value)} placeholder="メモ（任意）" rows={2} style={{ width: "100%", marginTop: 6, padding: "6px 8px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font, resize: "vertical", boxSizing: "border-box" }} />
             </Card>
           ) : (
-            <Btn variant="secondary" onClick={() => setAddingDeleg(true)} style={{ alignSelf: "flex-start" }}>+ 依頼タスクを追加</Btn>
-          )}
+            <Btn variant="secondary" onClick={() => setAddingDeleg(true)} style={{ alignSelf: "flex-start", fontSize: 11 }}>+ 依頼タスクを追加</Btn>
+          ))}
         </div>
-      )}
+        );
+      })()}
 
       {/* ═══ MONTHLY TAB (月次定期タスク) ═══ */}
       {tmTab === "monthly" && (

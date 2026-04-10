@@ -3,6 +3,7 @@ import { T } from "../../lib/constants";
 import { useApp } from "../../contexts/AppContext";
 import Toast from "../ui/Toast";
 import QuickTaskFab from "../ui/QuickTaskFab";
+import SheetSyncBadge from "../ui/SheetSyncBadge";
 import TaskManagementView from "../tasks/TaskManagementView";
 import ClientDashboardView from "../clients/ClientDashboardView";
 import SettingsView from "../settings/SettingsView";
@@ -62,7 +63,8 @@ export default function Stack() {
         position: "sticky", top: 0, zIndex: 100, gap: 6, overflowX: "auto",
       }}>
         <span style={{ fontSize: 15, fontWeight: 700, marginRight: 8, flexShrink: 0 }}>📚 Stack</span>
-        <div style={{ display: "flex", gap: 2, flexShrink: 0 }}>
+        <SheetSyncBadge />
+        <div style={{ display: "flex", gap: 2, flexShrink: 0, marginLeft: 4 }}>
           {TABS.map((t) => {
             return (
               <button key={t.id} onClick={() => setView(t.id)} style={{

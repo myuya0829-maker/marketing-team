@@ -16,6 +16,10 @@ dist-ssr
 .env
 .env.local
 .env.*.local
+.env.sync
+
+# OAuth tokens / secrets (never commit)
+tokens/
 
 # Editor directories and files
 .vscode/*
