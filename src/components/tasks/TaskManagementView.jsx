@@ -98,7 +98,6 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
   // Article state
   const [artMonthFilter, setArtMonthFilter] = useState(curMonth());
-  const [expandedArt, setExpandedArt] = useState(null);
 
   // Monthly recurring form
   const [addingMonthly, setAddingMonthly] = useState(false);
@@ -1851,28 +1850,43 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
       {/* ═══ ARTICLES TAB (コンテンツSEO進捗管理) ═══ */}
       {tmTab === "articles" && (() => {
-        // Phase K (2026-04-10): 記事管理シート由来 / view-only
-        // Count stats
-        const selfCount = filteredArticles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length;
-        const doneCount = filteredArticles.filter((a) => a.status === ART_DONE_STATUS).length;
-        const activeArticles = filteredArticles.filter((a) => a.status !== ART_DONE_STATUS);
-        // Sort: self-waiting first, then by progress (furthest along first)
-        const sorted = [...activeArticles].sort((a, b) => {
-          const idxA = ART_STEP_IDS.indexOf(a.status);
-          const idxB = ART_STEP_IDS.indexOf(b.status);
-          const selfA = (idxA >= 0 && ART_STEPS[idxA].self) ? 1 : 0;
-          const selfB = (idxB >= 0 && ART_STEPS[idxB].self) ? 1 : 0;
-          if (selfA !== selfB) return selfB - selfA;
-          if (idxA !== idxB) return idxB - idxA;
-          return 0;
+        // Phase L+ (2026-04-10): クライアント別サマリビュー
+        // 松下は個別記事を確認しないので、クライアント × ステータスのマトリクスで全体進捗を把握する
+        const selfCountTotal = filteredArticles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length;
+        const doneCountTotal = filteredArticles.filter((a) => a.status === ART_DONE_STATUS).length;
+        const activeTotal = filteredArticles.length - doneCountTotal;
+
+        // Group by client (project)
+        const clientMap = new Map();
+        for (const a of filteredArticles) {
+          const key = a.project || "(未分類)";
+          if (!clientMap.has(key)) {
+            clientMap.set(key, { name: key, total: 0, statusCounts: {} });
+          }
+          const entry = clientMap.get(key);
+          entry.total += 1;
+          entry.statusCounts[a.status] = (entry.statusCounts[a.status] || 0) + 1;
+        }
+        const clients = Array.from(clientMap.values()).map((c) => {
+          const selfCount = ART_STEPS.filter((s) => s.self).reduce((sum, s) => sum + (c.statusCounts[s.id] || 0), 0);
+          const doneCount = c.statusCounts[ART_DONE_STATUS] || 0;
+          const activeCount = c.total - doneCount;
+          return { ...c, selfCount, doneCount, activeCount };
         });
+        // 自分待ち多いクライアント → 進行中多いクライアント → 名前順
+        clients.sort((a, b) => {
+          if (a.selfCount !== b.selfCount) return b.selfCount - a.selfCount;
+          if (a.activeCount !== b.activeCount) return b.activeCount - a.activeCount;
+          return a.name.localeCompare(b.name);
+        });
+
         return (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {/* Header */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <div style={{ fontSize: 16, fontWeight: 700, color: T.text }}>📝 記事進捗 (山岸チーム)</div>
             <span style={{ fontSize: 11, color: T.textMuted }}>
-              全数 {filteredArticles.length} / 進行中 {activeArticles.length} / 入稿完了 {doneCount}
+              {clients.length} クライアント / 全 {filteredArticles.length} 本 / 進行中 {activeTotal} / 入稿完了 {doneCountTotal}
             </span>
           </div>
 
@@ -1883,10 +1897,10 @@ export default function TaskManagementView({ onNavigateToClient }) {
             <Btn variant="ghost" onClick={() => setArtMonthFilter(nextMonthKey(artMonthFilter))} style={{ fontSize: 14, padding: "4px 8px" }}>→</Btn>
             {artMonthFilter !== curMonth() && <Btn variant="secondary" onClick={() => setArtMonthFilter(curMonth())} style={{ fontSize: 10 }}>今月</Btn>}
             <div style={{ flex: 1 }} />
-            {selfCount > 0 && <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: T.error + "18", color: T.error, fontWeight: 600 }}>🔴 自分待ち {selfCount}</span>}
+            {selfCountTotal > 0 && <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: T.error + "18", color: T.error, fontWeight: 600 }}>🔴 自分待ち {selfCountTotal}</span>}
           </div>
 
-          {/* Pipeline summary bar */}
+          {/* Overall pipeline summary bar (全クライアント合計) */}
           <div style={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
             {ART_STEPS.map((step) => {
               const count = filteredArticles.filter((a) => a.status === step.id).length;
@@ -1897,108 +1911,79 @@ export default function TaskManagementView({ onNavigateToClient }) {
                 </div>
               );
             })}
-            <div style={{ flex: 1, padding: "6px 2px", background: doneCount > 0 ? T.success + "18" : T.bgCard, textAlign: "center", borderRadius: 4, minWidth: 50 }}>
-              <div style={{ fontSize: 8, color: doneCount > 0 ? T.success : T.textMuted, fontWeight: 600 }}>完了</div>
-              <div style={{ fontSize: 14, fontWeight: 700, color: doneCount > 0 ? T.success : T.textMuted }}>{doneCount}</div>
+            <div style={{ flex: 1, padding: "6px 2px", background: doneCountTotal > 0 ? T.success + "18" : T.bgCard, textAlign: "center", borderRadius: 4, minWidth: 50 }}>
+              <div style={{ fontSize: 8, color: doneCountTotal > 0 ? T.success : T.textMuted, fontWeight: 600 }}>入稿完了</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: doneCountTotal > 0 ? T.success : T.textMuted }}>{doneCountTotal}</div>
             </div>
           </div>
 
-          {/* Article list (sorted: self-waiting first) - VIEW ONLY (sheet が真実) */}
-          {sorted.map((art) => {
-            const stepIdx = ART_STEP_IDS.indexOf(art.status);
-            const curStep = stepIdx >= 0 ? ART_STEPS[stepIdx] : null;
-            const isSelf = curStep && curStep.self;
-            const badgeColor = isSelf ? T.error : (curStep ? T.accent : T.textMuted);
-            const expanded = expandedArt === art.id;
+          {/* ── クライアント別サマリ ── */}
+          {clients.length === 0 && (
+            <div style={{ textAlign: "center", padding: "20px 0", color: T.textMuted, fontSize: 12 }}>
+              この月の記事はありません
+            </div>
+          )}
+          {clients.map((c) => {
+            const hasSelfWaiting = c.selfCount > 0;
+            const allDone = c.activeCount === 0 && c.doneCount > 0;
             return (
-              <Card key={art.id} style={{ border: `1px solid ${isSelf ? T.error + "44" : badgeColor + "22"}`, background: isSelf ? T.error + "06" : undefined }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  {/* Status badge: red for self, blue for vendor */}
-                  <span style={{ fontSize: 10, padding: "3px 10px", borderRadius: 6, background: isSelf ? T.error + "15" : T.accent + "15", color: isSelf ? T.error : T.accent, fontWeight: 600, whiteSpace: "nowrap" }}>
-                    {isSelf ? "🔴" : "🔵"} {curStep ? curStep.label : "未着手"}
+              <Card key={c.name} style={{
+                border: `1px solid ${hasSelfWaiting ? T.error + "44" : allDone ? T.success + "33" : T.border}`,
+                background: hasSelfWaiting ? T.error + "06" : undefined,
+                opacity: allDone ? 0.75 : 1,
+              }}>
+                {/* Client header row */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <span style={{ fontSize: 14, fontWeight: 600, color: T.text, flex: 1 }}>
+                    {allDone && "✅ "}{c.name}
                   </span>
-                  {/* KW (主) + クライアント (従) */}
-                  <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>
-                    {art.name || art.kw}
-                    {art.project && <span style={{ marginLeft: 6, fontSize: 10, color: T.textMuted }}>[{art.project}]</span>}
-                  </span>
-                  {/* Progress dots */}
-                  <div style={{ display: "flex", gap: 3 }}>
-                    {ART_STEPS.map((s, i) => (
-                      <div key={s.id} style={{
-                        width: 8, height: 8, borderRadius: "50%",
-                        background: i < stepIdx ? T.success : i === stepIdx ? badgeColor : T.border,
-                        transition: "background 0.2s",
-                      }} />
-                    ))}
-                  </div>
-                  {/* Add to today's tasks (only if self-waiting) */}
-                  {isSelf && (
-                    <button onClick={async () => {
-                      await insertTaskDB(todayKey(), { name: `${curStep.label}：${art.name}`, project: art.project, estimateSec: 1800, deadline: todayKey() + "T00:00:00" });
-                      setToast(`📋 今日のタスクに追加: ${curStep.label}：${art.name}`);
-                    }} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: T.warning + "15", color: T.warning, border: "none", cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>📋 今日</button>
+                  {hasSelfWaiting && (
+                    <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, background: T.error + "15", color: T.error, fontWeight: 600, whiteSpace: "nowrap" }}>
+                      🔴 自分待ち {c.selfCount}
+                    </span>
                   )}
-                  <SheetLockBadge task={art} />
-                  <button onClick={() => setExpandedArt(expanded ? null : art.id)} style={{ fontSize: 10, background: "none", border: "none", cursor: "pointer", color: T.textMuted, fontFamily: T.font }}>{expanded ? "▼" : "▶"}</button>
+                  <span style={{ fontSize: 11, color: T.textMuted, whiteSpace: "nowrap" }}>
+                    全 {c.total} 本 / 完了 {c.doneCount}
+                  </span>
                 </div>
-                {/* Expanded: URLs + メタ */}
-                {expanded && (
-                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", flexDirection: "column", gap: 6, fontSize: 11, color: T.textMuted }}>
-                    {art.outlineUrl && <a href={art.outlineUrl} target="_blank" rel="noreferrer" style={{ color: T.cyan }}>📄 構成案 →</a>}
-                    {art.articleUrl && <a href={art.articleUrl} target="_blank" rel="noreferrer" style={{ color: T.cyan }}>📰 記事 →</a>}
-                    {art.outlineInstructions && <div>📋 構成指示: {art.outlineInstructions}</div>}
-                    <div>担当: {art.assignee || "—"} / 月: {art.month || "—"}</div>
+
+                {/* Per-client status mini-bar */}
+                <div style={{ display: "flex", gap: 2 }}>
+                  {ART_STEPS.map((step) => {
+                    const count = c.statusCounts[step.id] || 0;
+                    return (
+                      <div key={step.id} style={{
+                        flex: 1,
+                        padding: "4px 2px",
+                        background: count > 0 ? (step.self ? T.error + "18" : T.accent + "10") : T.bgCard,
+                        textAlign: "center",
+                        borderRadius: 3,
+                        minWidth: 40,
+                      }}>
+                        <div style={{ fontSize: 8, color: count > 0 ? (step.self ? T.error : T.accent) : T.textMuted, fontWeight: 600 }}>{step.label}</div>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: count > 0 ? (step.self ? T.error : T.accent) : T.textMuted }}>{count}</div>
+                      </div>
+                    );
+                  })}
+                  <div style={{
+                    flex: 1,
+                    padding: "4px 2px",
+                    background: c.doneCount > 0 ? T.success + "18" : T.bgCard,
+                    textAlign: "center",
+                    borderRadius: 3,
+                    minWidth: 40,
+                  }}>
+                    <div style={{ fontSize: 8, color: c.doneCount > 0 ? T.success : T.textMuted, fontWeight: 600 }}>入稿完了</div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: c.doneCount > 0 ? T.success : T.textMuted }}>{c.doneCount}</div>
                   </div>
-                )}
+                </div>
               </Card>
             );
           })}
 
-          {/* ── 入稿完了 ── */}
-          {doneCount > 0 && (
-            <div style={{ marginTop: 4 }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: T.success, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
-                ✅ 入稿完了 ({doneCount}件)
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {filteredArticles.filter((a) => a.status === ART_DONE_STATUS).map((art) => {
-                  const expanded = expandedArt === art.id;
-                  return (
-                    <Card key={art.id} style={{ border: `1px solid ${T.success}22`, opacity: 0.75 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <span style={{ fontSize: 10, padding: "3px 10px", borderRadius: 6, background: T.success + "15", color: T.success, fontWeight: 600, whiteSpace: "nowrap" }}>
-                          ✅ 入稿完了
-                        </span>
-                        <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>
-                          {art.name || art.kw}
-                          {art.project && <span style={{ marginLeft: 6, fontSize: 10, color: T.textMuted }}>[{art.project}]</span>}
-                        </span>
-                        <div style={{ display: "flex", gap: 3 }}>
-                          {ART_STEPS.map((s) => (
-                            <div key={s.id} style={{ width: 8, height: 8, borderRadius: "50%", background: T.success }} />
-                          ))}
-                        </div>
-                        <SheetLockBadge task={art} />
-                        <button onClick={() => setExpandedArt(expanded ? null : art.id)} style={{ fontSize: 10, background: "none", border: "none", cursor: "pointer", color: T.textMuted, fontFamily: T.font }}>{expanded ? "▼" : "▶"}</button>
-                      </div>
-                      {expanded && (
-                        <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", flexDirection: "column", gap: 6, fontSize: 11, color: T.textMuted }}>
-                          {art.outlineUrl && <a href={art.outlineUrl} target="_blank" rel="noreferrer" style={{ color: T.cyan }}>📄 構成案 →</a>}
-                          {art.articleUrl && <a href={art.articleUrl} target="_blank" rel="noreferrer" style={{ color: T.cyan }}>📰 記事 →</a>}
-                          <div>担当: {art.assignee || "—"} / 月: {art.month || "—"}</div>
-                        </div>
-                      )}
-                    </Card>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* シート由来 (view-only) なので追加 UI なし */}
+          {/* シート由来 (view-only) */}
           <div style={{ fontSize: 10, color: T.textMuted, textAlign: "center", marginTop: 8, padding: "8px 0", borderTop: `1px dashed ${T.border}` }}>
-            👁 記事管理シートが真実 (Stack は山岸チームの進捗を監視するだけ)
+            👁 記事管理シートが真実 (Stack は山岸チームの進捗を俯瞰するだけ)
           </div>
         </div>
         );
