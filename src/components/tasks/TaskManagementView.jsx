@@ -30,16 +30,18 @@ const CAT_COLORS = {
 
 // Article pipeline statuses (legacy-compatible 7 stages)
 // self: true = 自分待ち（赤バッジ）, false = 業者待ち（青バッジ）
+// Phase K (2026-04-10): 記事管理シートの実ステータスに合わせて再定義
+// self=true は松下が次のアクションを取るべき段階 (レビュー/承認/入稿)
 const ART_STEPS = [
-  { id: "kw_select",        label: "KW選定",      self: false, color: T.accent },
-  { id: "kw_review",        label: "KW確認",      self: true,  color: T.error },
-  { id: "structure",        label: "構成作成",    self: false, color: T.accent },
-  { id: "structure_review", label: "構成確認",    self: true,  color: T.error },
-  { id: "writing",          label: "執筆中",      self: false, color: T.accent },
-  { id: "writing_review",   label: "執筆確認",    self: true,  color: T.error },
-  { id: "submit",           label: "提出",        self: false, color: T.success },
+  { id: "構成中",       label: "構成中",     self: false, color: T.accent },
+  { id: "構成完了",     label: "構成完了",   self: true,  color: T.error },
+  { id: "承認済み",     label: "承認済み",   self: false, color: T.accent },
+  { id: "執筆中",       label: "執筆中",     self: false, color: T.accent },
+  { id: "執筆完了",     label: "執筆完了",   self: true,  color: T.error },
+  { id: "チェック済み", label: "チェック済み", self: true, color: T.error },
 ];
 const ART_STEP_IDS = ART_STEPS.map((s) => s.id);
+const ART_DONE_STATUS = "入稿完了";  // 完了扱いするステータス値
 
 const BALL_HOLDERS = [
   { id: "self", label: "自分", color: T.accent },
@@ -65,6 +67,8 @@ export default function TaskManagementView({ onNavigateToClient }) {
   const [delegations, setDelegations] = useState([]);
   const [inprogress, setInprogress] = useState([]);
   const [articles, setArticles] = useState([]);
+  const [reports, setReports] = useState([]);
+  const [reportMonthFilter, setReportMonthFilter] = useState(curMonth());
   const [, setTicker] = useState(0);
   const [loadingTasks, setLoadingTasks] = useState(true);
 
@@ -224,14 +228,16 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
   const loadSpecialTasks = useCallback(async () => {
     try {
-      const [del, inp, art] = await Promise.all([
+      const [del, inp, art, rep] = await Promise.all([
         fetchTasksByType("delegation").catch(() => []),
         fetchTasksByType("inprogress").catch(() => []),
         fetchTasksByType("article").catch(() => []),
+        fetchTasksByType("report").catch(() => []),
       ]);
       setDelegations(del);
       setInprogress(inp);
       setArticles(art);
+      setReports(rep);
     } catch (e) {
       console.error("loadSpecialTasks:", e);
     }
@@ -770,40 +776,26 @@ export default function TaskManagementView({ onNavigateToClient }) {
     await deleteTaskDB(id);
   };
 
-  // ── Article CRUD ──
-  const addArticle = async (projectName) => {
-    await insertTaskDB(todayKey(), {
-      name: projectName, project: projectName, month: artMonthFilter,
-      status: "kw_select", taskType: "article",
-    });
-    await loadSpecialTasks();
-  };
+  // ── Article CRUD removed (Phase K, 2026-04-10): 記事は記事管理シートが真実 ──
 
-  const advanceArticle = async (id) => {
-    const art = articles.find((a) => a.id === id);
-    if (!art) return;
-    const idx = ART_STEPS.findIndex((s) => s.id === art.status);
-    if (idx < ART_STEPS.length - 1) {
-      const next = ART_STEPS[idx + 1].id;
-      setArticles((prev) => prev.map((a) => (a.id === id ? { ...a, status: next } : a)));
-      await updateTaskDB(id, { status: next });
+  // ── Report stage toggle (Phase L) ──
+  // 4 ステージ (データ取得 / レポート生成 / レビュー / 送信) を Stack で更新
+  // 注: ここで更新しても sync-stack.py 次回実行で sheet 値で上書きされる可能性あり
+  // → done のみ一方向アップグレード保護されている (build_report_update_body)
+  // ステージ状態自体は EOD writeback でシートに反映する運用
+  const toggleReportStage = async (id, stageField) => {
+    const rep = reports.find((r) => r.id === id);
+    if (!rep) return;
+    const cur = rep[stageField];
+    const next = (cur === "完了") ? "未着手" : "完了";
+    const updates = { [stageField]: next };
+    // 送信が完了 → done=true (一方向)
+    if (stageField === "reportSend" && next === "完了") {
+      updates.done = true;
+      updates.completedAt = new Date().toISOString();
     }
-  };
-
-  const revertArticle = async (id) => {
-    const art = articles.find((a) => a.id === id);
-    if (!art) return;
-    const idx = ART_STEP_IDS.indexOf(art.status);
-    if (idx > 0) {
-      const prev = ART_STEP_IDS[idx - 1];
-      setArticles((p) => p.map((a) => (a.id === id ? { ...a, status: prev } : a)));
-      await updateTaskDB(id, { status: prev });
-    }
-  };
-
-  const deleteArticle = async (id) => {
-    setArticles((prev) => prev.filter((a) => a.id !== id));
-    await deleteTaskDB(id);
+    setReports((prev) => prev.map((r) => (r.id === id ? { ...r, ...updates } : r)));
+    await updateTaskDB(id, updates);
   };
 
   // ── Navigation ──
@@ -853,7 +845,8 @@ export default function TaskManagementView({ onNavigateToClient }) {
             { id: "list", label: "📋 一覧" },
             { id: "inprog", label: "🔄 進行中", badge: inprogress.filter((t) => !t.done).length + pendingDelegCount },
             { id: "monthly", label: "📆 月次", badge: recurring.length },
-            { id: "articles", label: "📝 コンテンツSEO", badge: articles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length },
+            { id: "articles", label: "📝 記事", badge: articles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length },
+            { id: "reports", label: "📊 レポート", badge: reports.filter((r) => !r.done && r.month === reportMonthFilter).length },
             { id: "completed", label: "✅ 完了" },
           ].map((t) => (
             <button key={t.id} onClick={() => setTmTab(t.id)} style={{
@@ -1843,10 +1836,11 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
       {/* ═══ ARTICLES TAB (コンテンツSEO進捗管理) ═══ */}
       {tmTab === "articles" && (() => {
+        // Phase K (2026-04-10): 記事管理シート由来 / view-only
         // Count stats
         const selfCount = filteredArticles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length;
-        const doneCount = filteredArticles.filter((a) => a.status === "done").length;
-        const activeArticles = filteredArticles.filter((a) => a.status !== "done");
+        const doneCount = filteredArticles.filter((a) => a.status === ART_DONE_STATUS).length;
+        const activeArticles = filteredArticles.filter((a) => a.status !== ART_DONE_STATUS);
         // Sort: self-waiting first, then by progress (furthest along first)
         const sorted = [...activeArticles].sort((a, b) => {
           const idxA = ART_STEP_IDS.indexOf(a.status);
@@ -1861,9 +1855,9 @@ export default function TaskManagementView({ onNavigateToClient }) {
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {/* Header */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div style={{ fontSize: 16, fontWeight: 700, color: T.text }}>📝 コンテンツSEO進捗管理</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: T.text }}>📝 記事進捗 (山岸チーム)</div>
             <span style={{ fontSize: 11, color: T.textMuted }}>
-              全数 {filteredArticles.length} / 進行中 {activeArticles.length} / 完了 {doneCount}
+              全数 {filteredArticles.length} / 進行中 {activeArticles.length} / 入稿完了 {doneCount}
             </span>
           </div>
 
@@ -1894,7 +1888,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
             </div>
           </div>
 
-          {/* Article list (sorted: self-waiting first) */}
+          {/* Article list (sorted: self-waiting first) - VIEW ONLY (sheet が真実) */}
           {sorted.map((art) => {
             const stepIdx = ART_STEP_IDS.indexOf(art.status);
             const curStep = stepIdx >= 0 ? ART_STEPS[stepIdx] : null;
@@ -1904,14 +1898,16 @@ export default function TaskManagementView({ onNavigateToClient }) {
             return (
               <Card key={art.id} style={{ border: `1px solid ${isSelf ? T.error + "44" : badgeColor + "22"}`, background: isSelf ? T.error + "06" : undefined }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <button onClick={() => revertArticle(art.id)} disabled={stepIdx <= 0} style={{ fontSize: 12, background: "none", border: "none", cursor: "pointer", color: T.textMuted, opacity: stepIdx <= 0 ? 0.2 : 0.6, fontFamily: T.font }}>◀</button>
                   {/* Status badge: red for self, blue for vendor */}
                   <span style={{ fontSize: 10, padding: "3px 10px", borderRadius: 6, background: isSelf ? T.error + "15" : T.accent + "15", color: isSelf ? T.error : T.accent, fontWeight: 600, whiteSpace: "nowrap" }}>
                     {isSelf ? "🔴" : "🔵"} {curStep ? curStep.label : "未着手"}
                   </span>
-                  {/* Project name */}
-                  <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>{art.project || art.name}</span>
-                  {/* Progress dots: green=done, red/blue=current, gray=future */}
+                  {/* KW (主) + クライアント (従) */}
+                  <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>
+                    {art.name || art.kw}
+                    {art.project && <span style={{ marginLeft: 6, fontSize: 10, color: T.textMuted }}>[{art.project}]</span>}
+                  </span>
+                  {/* Progress dots */}
                   <div style={{ display: "flex", gap: 3 }}>
                     {ART_STEPS.map((s, i) => (
                       <div key={s.id} style={{
@@ -1921,65 +1917,61 @@ export default function TaskManagementView({ onNavigateToClient }) {
                       }} />
                     ))}
                   </div>
-                  {renderDeadline(art.id, art.deadline, { afterSave: async (id, iso) => { setArticles((prev) => prev.map((a) => a.id === id ? { ...a, deadline: iso } : a)); await updateTaskDB(id, { deadline: iso }); } })}
                   {/* Add to today's tasks (only if self-waiting) */}
                   {isSelf && (
                     <button onClick={async () => {
-                      await insertTaskDB(todayKey(), { name: `${curStep.label}：${art.project}`, project: art.project, estimateSec: 1800, deadline: todayKey() + "T00:00:00" });
-                      setToast(`📋 今日のタスクに追加: ${curStep.label}：${art.project}`);
+                      await insertTaskDB(todayKey(), { name: `${curStep.label}：${art.name}`, project: art.project, estimateSec: 1800, deadline: todayKey() + "T00:00:00" });
+                      setToast(`📋 今日のタスクに追加: ${curStep.label}：${art.name}`);
                     }} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: T.warning + "15", color: T.warning, border: "none", cursor: "pointer", fontFamily: T.font, whiteSpace: "nowrap" }}>📋 今日</button>
                   )}
-                  {/* Advance button */}
-                  <button onClick={() => stepIdx === ART_STEP_IDS.length - 1 ? (async () => { setArticles((prev) => prev.map((a) => (a.id === art.id ? { ...a, status: "done" } : a))); await updateTaskDB(art.id, { status: "done" }); })() : advanceArticle(art.id)} style={{ fontSize: 12, background: "none", border: "none", cursor: "pointer", color: stepIdx === ART_STEP_IDS.length - 1 ? T.success : badgeColor, fontFamily: T.font }}>
-                    {stepIdx === ART_STEP_IDS.length - 1 ? "完了✓" : "次へ→"}
-                  </button>
+                  <SheetLockBadge task={art} />
                   <button onClick={() => setExpandedArt(expanded ? null : art.id)} style={{ fontSize: 10, background: "none", border: "none", cursor: "pointer", color: T.textMuted, fontFamily: T.font }}>{expanded ? "▼" : "▶"}</button>
                 </div>
-                {/* Expanded controls */}
+                {/* Expanded: URLs + メタ */}
                 {expanded && (
-                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-                    <select value={art.status} onChange={async (e) => { setArticles((prev) => prev.map((a) => (a.id === art.id ? { ...a, status: e.target.value } : a))); await updateTaskDB(art.id, { status: e.target.value }); }} style={{ padding: "4px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }}>
-                      {ART_STEPS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
-                      <option value="done">✅ 完了</option>
-                    </select>
-                    <Btn variant="danger" onClick={() => deleteArticle(art.id)} style={{ fontSize: 10, padding: "3px 10px" }}>🗑 削除</Btn>
+                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", flexDirection: "column", gap: 6, fontSize: 11, color: T.textMuted }}>
+                    {art.outlineUrl && <a href={art.outlineUrl} target="_blank" rel="noreferrer" style={{ color: T.cyan }}>📄 構成案 →</a>}
+                    {art.articleUrl && <a href={art.articleUrl} target="_blank" rel="noreferrer" style={{ color: T.cyan }}>📰 記事 →</a>}
+                    {art.outlineInstructions && <div>📋 構成指示: {art.outlineInstructions}</div>}
+                    <div>担当: {art.assignee || "—"} / 月: {art.month || "—"}</div>
                   </div>
                 )}
               </Card>
             );
           })}
 
-          {/* ── Completed articles ── */}
+          {/* ── 入稿完了 ── */}
           {doneCount > 0 && (
             <div style={{ marginTop: 4 }}>
               <div style={{ fontSize: 11, fontWeight: 600, color: T.success, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
-                ✅ 完了 ({doneCount}件)
+                ✅ 入稿完了 ({doneCount}件)
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {filteredArticles.filter((a) => a.status === "done").map((art) => {
+                {filteredArticles.filter((a) => a.status === ART_DONE_STATUS).map((art) => {
                   const expanded = expandedArt === art.id;
                   return (
                     <Card key={art.id} style={{ border: `1px solid ${T.success}22`, opacity: 0.75 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                         <span style={{ fontSize: 10, padding: "3px 10px", borderRadius: 6, background: T.success + "15", color: T.success, fontWeight: 600, whiteSpace: "nowrap" }}>
-                          ✅ 完了
+                          ✅ 入稿完了
                         </span>
-                        <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>{art.project || art.name}</span>
-                        {/* All dots green */}
+                        <span style={{ fontSize: 13, fontWeight: 500, color: T.text, flex: 1 }}>
+                          {art.name || art.kw}
+                          {art.project && <span style={{ marginLeft: 6, fontSize: 10, color: T.textMuted }}>[{art.project}]</span>}
+                        </span>
                         <div style={{ display: "flex", gap: 3 }}>
                           {ART_STEPS.map((s) => (
                             <div key={s.id} style={{ width: 8, height: 8, borderRadius: "50%", background: T.success }} />
                           ))}
                         </div>
+                        <SheetLockBadge task={art} />
                         <button onClick={() => setExpandedArt(expanded ? null : art.id)} style={{ fontSize: 10, background: "none", border: "none", cursor: "pointer", color: T.textMuted, fontFamily: T.font }}>{expanded ? "▼" : "▶"}</button>
                       </div>
                       {expanded && (
-                        <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-                          <select value={art.status} onChange={async (e) => { setArticles((prev) => prev.map((a) => (a.id === art.id ? { ...a, status: e.target.value } : a))); await updateTaskDB(art.id, { status: e.target.value }); }} style={{ padding: "4px 6px", background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 11, fontFamily: T.font }}>
-                            {ART_STEPS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
-                            <option value="done">✅ 完了</option>
-                          </select>
-                          <Btn variant="danger" onClick={() => deleteArticle(art.id)} style={{ fontSize: 10, padding: "3px 10px" }}>🗑 削除</Btn>
+                        <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${T.border}`, display: "flex", flexDirection: "column", gap: 6, fontSize: 11, color: T.textMuted }}>
+                          {art.outlineUrl && <a href={art.outlineUrl} target="_blank" rel="noreferrer" style={{ color: T.cyan }}>📄 構成案 →</a>}
+                          {art.articleUrl && <a href={art.articleUrl} target="_blank" rel="noreferrer" style={{ color: T.cyan }}>📰 記事 →</a>}
+                          <div>担当: {art.assignee || "—"} / 月: {art.month || "—"}</div>
                         </div>
                       )}
                     </Card>
@@ -1989,20 +1981,106 @@ export default function TaskManagementView({ onNavigateToClient }) {
             </div>
           )}
 
-          {/* Add article */}
-          <Card style={{ border: `1px solid ${T.border}` }}>
-            <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 6 }}>記事案件を追加</div>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {(projects || []).filter((p) => p.articleEnabled || (p.services || []).includes("SEO")).slice(0, 50).map((p) => {
-                const exists = filteredArticles.some((a) => (a.project === p.name || a.name === p.name));
-                return (
-                  <button key={p.id} onClick={() => !exists && addArticle(p.name)} disabled={exists} style={{ fontSize: 10, padding: "3px 10px", borderRadius: 99, background: exists ? T.bgCard : T.accent + "12", color: exists ? T.textMuted : T.accent, border: `1px solid ${exists ? T.border : T.accent + "44"}`, cursor: exists ? "default" : "pointer", fontFamily: T.font, opacity: exists ? 0.4 : 1 }}>
-                    {exists ? "✓" : "+"} {truncate(p.name, 15)}
-                  </button>
-                );
-              })}
+          {/* シート由来 (view-only) なので追加 UI なし */}
+          <div style={{ fontSize: 10, color: T.textMuted, textAlign: "center", marginTop: 8, padding: "8px 0", borderTop: `1px dashed ${T.border}` }}>
+            🔒 記事管理シートが真実 (Stack では編集不可)
+          </div>
+        </div>
+        );
+      })()}
+
+      {/* ═══ REPORTS TAB (Phase L, 2026-04-10) ═══ */}
+      {tmTab === "reports" && (() => {
+        const REPORT_STAGES = [
+          { id: "reportData", label: "データ取得" },
+          { id: "reportGen", label: "レポート生成" },
+          { id: "reportSend", label: "送信" },
+        ];
+        const filteredReports = reports.filter((r) => r.month === reportMonthFilter);
+        const sorted = [...filteredReports].sort((a, b) => {
+          // 未着手フェーズが多いものを上に
+          const incomA = REPORT_STAGES.filter((s) => a[s.id] !== "完了").length;
+          const incomB = REPORT_STAGES.filter((s) => b[s.id] !== "完了").length;
+          if (incomA !== incomB) return incomB - incomA;
+          return (a.clientName || "").localeCompare(b.clientName || "");
+        });
+        const doneCount = filteredReports.filter((r) => r.reportSend === "完了").length;
+        const stageCount = (stageId) => filteredReports.filter((r) => r[stageId] === "完了").length;
+        return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {/* Header */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: T.text }}>📊 月次レポート進捗</div>
+            <span style={{ fontSize: 11, color: T.textMuted }}>
+              全{filteredReports.length} / 送信完了 {doneCount}
+            </span>
+          </div>
+
+          {/* Month nav */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Btn variant="ghost" onClick={() => setReportMonthFilter(prevMonthKey(reportMonthFilter))} style={{ fontSize: 14, padding: "4px 8px" }}>←</Btn>
+            <span style={{ fontSize: 14, fontWeight: 600, color: T.text }}>{monthLabel(reportMonthFilter)}</span>
+            <Btn variant="ghost" onClick={() => setReportMonthFilter(nextMonthKey(reportMonthFilter))} style={{ fontSize: 14, padding: "4px 8px" }}>→</Btn>
+            {reportMonthFilter !== curMonth() && <Btn variant="secondary" onClick={() => setReportMonthFilter(curMonth())} style={{ fontSize: 10 }}>今月</Btn>}
+          </div>
+
+          {/* Pipeline summary */}
+          <div style={{ display: "flex", gap: 4 }}>
+            {REPORT_STAGES.map((stage) => {
+              const cnt = stageCount(stage.id);
+              const pct = filteredReports.length > 0 ? Math.round((cnt / filteredReports.length) * 100) : 0;
+              return (
+                <div key={stage.id} style={{ flex: 1, padding: "6px 4px", background: cnt > 0 ? T.accent + "10" : T.bgCard, borderRadius: 4, textAlign: "center" }}>
+                  <div style={{ fontSize: 9, color: T.textMuted, fontWeight: 600 }}>{stage.label}</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: cnt > 0 ? T.accent : T.textMuted }}>{cnt}/{filteredReports.length}</div>
+                  <div style={{ fontSize: 8, color: T.textMuted }}>{pct}%</div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Report list */}
+          {sorted.length === 0 && (
+            <div style={{ padding: 20, textAlign: "center", color: T.textMuted, fontSize: 12 }}>
+              {reportMonthFilter} のレポートはありません
             </div>
-          </Card>
+          )}
+          {sorted.map((rep) => {
+            const allDone = REPORT_STAGES.every((s) => rep[s.id] === "完了");
+            return (
+              <Card key={rep.id} style={{ border: `1px solid ${allDone ? T.success + "44" : T.border}`, background: allDone ? T.success + "06" : undefined }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: T.text, flex: 1, minWidth: 120 }}>{rep.clientName || rep.name}</span>
+                  {/* Stage toggle buttons */}
+                  {REPORT_STAGES.map((stage) => {
+                    const done = rep[stage.id] === "完了";
+                    return (
+                      <button key={stage.id} onClick={() => toggleReportStage(rep.id, stage.id)} title={done ? "クリックで未着手に戻す" : "クリックで完了"} style={{
+                        fontSize: 10, padding: "3px 8px", borderRadius: 4,
+                        background: done ? T.success + "20" : T.bgCard,
+                        color: done ? T.success : T.textMuted,
+                        border: `1px solid ${done ? T.success + "55" : T.border}`,
+                        cursor: "pointer", fontFamily: T.font, fontWeight: 600, whiteSpace: "nowrap",
+                      }}>
+                        {done ? "✓" : "○"} {stage.label}
+                      </button>
+                    );
+                  })}
+                  {rep.reportReviewUrl && (
+                    <a href={rep.reportReviewUrl} target="_blank" rel="noreferrer" style={{ fontSize: 10, padding: "3px 8px", borderRadius: 4, background: T.cyan + "15", color: T.cyan, textDecoration: "none", whiteSpace: "nowrap" }}>📄 レビュー →</a>
+                  )}
+                  <SheetLockBadge task={rep} />
+                </div>
+                {rep.reportNote && (
+                  <div style={{ marginTop: 6, fontSize: 10, color: T.textMuted }}>📝 {rep.reportNote}</div>
+                )}
+              </Card>
+            );
+          })}
+
+          <div style={{ fontSize: 10, color: T.textMuted, textAlign: "center", marginTop: 8, padding: "8px 0", borderTop: `1px dashed ${T.border}` }}>
+            ⚠️ ステージ更新は Stack 内で完結 (シート反映は EOD writeback で実施)
+          </div>
         </div>
         );
       })()}

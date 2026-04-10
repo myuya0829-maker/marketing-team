@@ -271,7 +271,60 @@ const mapTaskRow = (row) => ({
   sheetSyncedAt: row.sheet_synced_at || null,
   sheetCategory: row.sheet_category || null,
   sheetPriority: row.sheet_priority || null,
+  // 記事管理 (Phase K)
+  kw: row.kw || null,
+  outlineUrl: row.outline_url || null,
+  articleUrl: row.article_url || null,
+  outlineInstructions: row.outline_instructions || null,
+  // レポート管理 (Phase L)
+  reportData: row.report_data || null,
+  reportGen: row.report_gen || null,
+  reportReviewUrl: row.report_review_url || null,
+  reportSend: row.report_send || null,
+  reportNote: row.report_note || null,
 });
+
+// ========================
+// Phase K/L: Articles + Reports fetchers
+// ========================
+
+/**
+ * Fetch all 記事 tasks (task_type='article'). View-only.
+ * Sorted by client + status.
+ */
+export const fetchArticles = async () => {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .eq("task_type", "article")
+    .order("client_name", { ascending: true })
+    .order("created_at", { ascending: true });
+  if (error) {
+    console.error("fetchArticles:", error);
+    return [];
+  }
+  return (data || []).map(mapTaskRow);
+};
+
+/**
+ * Fetch all レポート tasks (task_type='report'). Editable.
+ * Sorted by month desc + client.
+ */
+export const fetchReports = async () => {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("*")
+    .eq("user_id", USER_ID)
+    .eq("task_type", "report")
+    .order("month", { ascending: false, nullsFirst: false })
+    .order("client_name", { ascending: true });
+  if (error) {
+    console.error("fetchReports:", error);
+    return [];
+  }
+  return (data || []).map(mapTaskRow);
+};
 
 export const insertTask = async (dateKey, task) => {
   const { data, error } = await supabase
@@ -332,6 +385,17 @@ export const updateTask = async (id, updates) => {
   if (updates.month !== undefined) mapped.month = updates.month;
   if (updates.taskDate !== undefined) mapped.task_date = updates.taskDate;
   if (updates.completedAt !== undefined) mapped.completed_at = updates.completedAt;
+  // Phase K: 記事
+  if (updates.kw !== undefined) mapped.kw = updates.kw;
+  if (updates.outlineUrl !== undefined) mapped.outline_url = updates.outlineUrl;
+  if (updates.articleUrl !== undefined) mapped.article_url = updates.articleUrl;
+  if (updates.outlineInstructions !== undefined) mapped.outline_instructions = updates.outlineInstructions;
+  // Phase L: レポート
+  if (updates.reportData !== undefined) mapped.report_data = updates.reportData;
+  if (updates.reportGen !== undefined) mapped.report_gen = updates.reportGen;
+  if (updates.reportReviewUrl !== undefined) mapped.report_review_url = updates.reportReviewUrl;
+  if (updates.reportSend !== undefined) mapped.report_send = updates.reportSend;
+  if (updates.reportNote !== undefined) mapped.report_note = updates.reportNote;
 
   const { error } = await supabase.from("tasks").update(mapped).eq("id", id);
   if (error) console.error("updateTask:", error);
