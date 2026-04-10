@@ -859,7 +859,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
             { id: "list", label: "📋 一覧" },
             { id: "inprog", label: "🔄 進行中", badge: inprogress.filter((t) => !t.done).length + pendingDelegCount },
             { id: "monthly", label: "📆 月次", badge: recurring.length },
-            { id: "articles", label: "📝 記事", badge: articles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length },
+            { id: "articles", label: "📝 記事", badge: articles.filter((a) => a.month === artMonthFilter && a.status !== ART_DONE_STATUS).length },
             { id: "reports", label: "📊 レポート", badge: reports.filter((r) => !r.done && r.month === reportMonthFilter).length },
             { id: "completed", label: "✅ 完了" },
           ].map((t) => (
@@ -1851,10 +1851,17 @@ export default function TaskManagementView({ onNavigateToClient }) {
       {/* ═══ ARTICLES TAB (コンテンツSEO進捗管理) ═══ */}
       {tmTab === "articles" && (() => {
         // Phase L+ (2026-04-10): クライアント別サマリビュー
-        // 松下は個別記事を確認しないので、クライアント × ステータスのマトリクスで全体進捗を把握する
-        const selfCountTotal = filteredArticles.filter((a) => { const st = ART_STEPS.find((s) => s.id === a.status); return st && st.self; }).length;
+        // 松下は個別記事制作に関わらないので、純粋な俯瞰ビューとして設計
+        // - 「自分待ち」概念は削除 (意味がない)
+        // - 0 件のステータスは非表示 (ノイズ削減)
         const doneCountTotal = filteredArticles.filter((a) => a.status === ART_DONE_STATUS).length;
         const activeTotal = filteredArticles.length - doneCountTotal;
+
+        // All displayable status steps (進行中 6 段階 + 入稿完了)
+        const ALL_STEPS = [
+          ...ART_STEPS.map((s) => ({ id: s.id, label: s.label, color: T.accent, bg: T.accent + "12" })),
+          { id: ART_DONE_STATUS, label: "入稿完了", color: T.success, bg: T.success + "18" },
+        ];
 
         // Group by client (project)
         const clientMap = new Map();
@@ -1868,20 +1875,24 @@ export default function TaskManagementView({ onNavigateToClient }) {
           entry.statusCounts[a.status] = (entry.statusCounts[a.status] || 0) + 1;
         }
         const clients = Array.from(clientMap.values()).map((c) => {
-          const selfCount = ART_STEPS.filter((s) => s.self).reduce((sum, s) => sum + (c.statusCounts[s.id] || 0), 0);
           const doneCount = c.statusCounts[ART_DONE_STATUS] || 0;
           const activeCount = c.total - doneCount;
-          return { ...c, selfCount, doneCount, activeCount };
+          return { ...c, doneCount, activeCount };
         });
-        // 自分待ち多いクライアント → 進行中多いクライアント → 名前順
+        // 進行中多いクライアント → 完了件数多い順 → 名前順
         clients.sort((a, b) => {
-          if (a.selfCount !== b.selfCount) return b.selfCount - a.selfCount;
           if (a.activeCount !== b.activeCount) return b.activeCount - a.activeCount;
+          if (a.doneCount !== b.doneCount) return b.doneCount - a.doneCount;
           return a.name.localeCompare(b.name);
         });
 
+        // Overall (全クライアント合計) pipeline - 0 件は省く
+        const overallSteps = ALL_STEPS
+          .map((s) => ({ ...s, count: filteredArticles.filter((a) => a.status === s.id).length }))
+          .filter((s) => s.count > 0);
+
         return (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {/* Header */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <div style={{ fontSize: 16, fontWeight: 700, color: T.text }}>📝 記事進捗 (山岸チーム)</div>
@@ -1896,26 +1907,27 @@ export default function TaskManagementView({ onNavigateToClient }) {
             <span style={{ fontSize: 14, fontWeight: 600, color: T.text }}>{monthLabel(artMonthFilter)}</span>
             <Btn variant="ghost" onClick={() => setArtMonthFilter(nextMonthKey(artMonthFilter))} style={{ fontSize: 14, padding: "4px 8px" }}>→</Btn>
             {artMonthFilter !== curMonth() && <Btn variant="secondary" onClick={() => setArtMonthFilter(curMonth())} style={{ fontSize: 10 }}>今月</Btn>}
-            <div style={{ flex: 1 }} />
-            {selfCountTotal > 0 && <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: T.error + "18", color: T.error, fontWeight: 600 }}>🔴 自分待ち {selfCountTotal}</span>}
           </div>
 
-          {/* Overall pipeline summary bar (全クライアント合計) */}
-          <div style={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
-            {ART_STEPS.map((step) => {
-              const count = filteredArticles.filter((a) => a.status === step.id).length;
-              return (
-                <div key={step.id} style={{ flex: 1, padding: "6px 2px", background: count > 0 ? (step.self ? T.error + "18" : T.accent + "10") : T.bgCard, textAlign: "center", borderRadius: 4, minWidth: 50 }}>
-                  <div style={{ fontSize: 8, color: count > 0 ? (step.self ? T.error : T.accent) : T.textMuted, fontWeight: 600 }}>{step.label}</div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: count > 0 ? (step.self ? T.error : T.accent) : T.textMuted }}>{count}</div>
+          {/* Overall pipeline summary (全クライアント合計) - 0件は省く */}
+          {overallSteps.length > 0 && (
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {overallSteps.map((step) => (
+                <div key={step.id} style={{
+                  padding: "8px 14px",
+                  background: step.bg,
+                  borderRadius: 6,
+                  display: "flex",
+                  alignItems: "baseline",
+                  gap: 8,
+                  border: `1px solid ${step.color}22`,
+                }}>
+                  <span style={{ fontSize: 10, color: step.color, fontWeight: 600 }}>{step.label}</span>
+                  <span style={{ fontSize: 16, color: step.color, fontWeight: 700 }}>{step.count}</span>
                 </div>
-              );
-            })}
-            <div style={{ flex: 1, padding: "6px 2px", background: doneCountTotal > 0 ? T.success + "18" : T.bgCard, textAlign: "center", borderRadius: 4, minWidth: 50 }}>
-              <div style={{ fontSize: 8, color: doneCountTotal > 0 ? T.success : T.textMuted, fontWeight: 600 }}>入稿完了</div>
-              <div style={{ fontSize: 14, fontWeight: 700, color: doneCountTotal > 0 ? T.success : T.textMuted }}>{doneCountTotal}</div>
+              ))}
             </div>
-          </div>
+          )}
 
           {/* ── クライアント別サマリ ── */}
           {clients.length === 0 && (
@@ -1924,58 +1936,43 @@ export default function TaskManagementView({ onNavigateToClient }) {
             </div>
           )}
           {clients.map((c) => {
-            const hasSelfWaiting = c.selfCount > 0;
             const allDone = c.activeCount === 0 && c.doneCount > 0;
+            // この client で 0 件以外の step のみ
+            const visibleSteps = ALL_STEPS
+              .map((s) => ({ ...s, count: c.statusCounts[s.id] || 0 }))
+              .filter((s) => s.count > 0);
             return (
               <Card key={c.name} style={{
-                border: `1px solid ${hasSelfWaiting ? T.error + "44" : allDone ? T.success + "33" : T.border}`,
-                background: hasSelfWaiting ? T.error + "06" : undefined,
+                border: `1px solid ${allDone ? T.success + "33" : T.border}`,
                 opacity: allDone ? 0.75 : 1,
               }}>
                 {/* Client header row */}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                   <span style={{ fontSize: 14, fontWeight: 600, color: T.text, flex: 1 }}>
                     {allDone && "✅ "}{c.name}
                   </span>
-                  {hasSelfWaiting && (
-                    <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, background: T.error + "15", color: T.error, fontWeight: 600, whiteSpace: "nowrap" }}>
-                      🔴 自分待ち {c.selfCount}
-                    </span>
-                  )}
                   <span style={{ fontSize: 11, color: T.textMuted, whiteSpace: "nowrap" }}>
-                    全 {c.total} 本 / 完了 {c.doneCount}
+                    全 {c.total} 本
+                    {c.doneCount > 0 && <span style={{ color: T.success, marginLeft: 6 }}>・完了 {c.doneCount}</span>}
                   </span>
                 </div>
 
-                {/* Per-client status mini-bar */}
-                <div style={{ display: "flex", gap: 2 }}>
-                  {ART_STEPS.map((step) => {
-                    const count = c.statusCounts[step.id] || 0;
-                    return (
-                      <div key={step.id} style={{
-                        flex: 1,
-                        padding: "4px 2px",
-                        background: count > 0 ? (step.self ? T.error + "18" : T.accent + "10") : T.bgCard,
-                        textAlign: "center",
-                        borderRadius: 3,
-                        minWidth: 40,
-                      }}>
-                        <div style={{ fontSize: 8, color: count > 0 ? (step.self ? T.error : T.accent) : T.textMuted, fontWeight: 600 }}>{step.label}</div>
-                        <div style={{ fontSize: 12, fontWeight: 700, color: count > 0 ? (step.self ? T.error : T.accent) : T.textMuted }}>{count}</div>
-                      </div>
-                    );
-                  })}
-                  <div style={{
-                    flex: 1,
-                    padding: "4px 2px",
-                    background: c.doneCount > 0 ? T.success + "18" : T.bgCard,
-                    textAlign: "center",
-                    borderRadius: 3,
-                    minWidth: 40,
-                  }}>
-                    <div style={{ fontSize: 8, color: c.doneCount > 0 ? T.success : T.textMuted, fontWeight: 600 }}>入稿完了</div>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: c.doneCount > 0 ? T.success : T.textMuted }}>{c.doneCount}</div>
-                  </div>
+                {/* Per-client status chips - 0件は省く */}
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {visibleSteps.map((step) => (
+                    <div key={step.id} style={{
+                      padding: "4px 10px",
+                      background: step.bg,
+                      borderRadius: 4,
+                      display: "flex",
+                      alignItems: "baseline",
+                      gap: 6,
+                      border: `1px solid ${step.color}22`,
+                    }}>
+                      <span style={{ fontSize: 9, color: step.color, fontWeight: 600 }}>{step.label}</span>
+                      <span style={{ fontSize: 13, color: step.color, fontWeight: 700 }}>{step.count}</span>
+                    </div>
+                  ))}
                 </div>
               </Card>
             );
