@@ -407,7 +407,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
     const today = todayKey();
     return dayTasks.filter((t) => {
       if (t.taskType && t.taskType !== "daily") return false;
-      if (t.deadline && dl(t.deadline) !== date) return false;
+      if (t.deadline && dl(t.deadline) !== date && !t.done) return false;
       // 過去日: 未完了で期限切れのタスクは今日ビューに移動済みなので非表示
       if (date < today && !t.done && t.deadline && dl(t.deadline) <= today) return false;
       return true;
