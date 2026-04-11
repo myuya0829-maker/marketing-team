@@ -71,6 +71,10 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
   // (localStorage doneIds cleanup removed — tasks table is source of truth)
 
+  // Refs for auto-save interval (stale closure 防止: 依存配列を空にするため ref 経由でアクセス)
+  const dayTasksRef = useRef([]);
+  const projTimersRef = useRef({});
+
   const [tmTab, setTmTab] = useState("today");
   const [inprogFilter, setInprogFilter] = useState("all"); // "all" | "self" | "other"
   const [date, setDate] = useState(todayKey());
@@ -130,18 +134,18 @@ export default function TaskManagementView({ onNavigateToClient }) {
   const [editingMemo, setEditingMemo] = useState(null);
   const [memoText, setMemoText] = useState("");
   const [editDL, setEditDL] = useState(null); // { id, val } for inline deadline editing
+  const [quickDelegId, setQuickDelegId] = useState(null); // daily task id being quick-delegated
+  const [quickDelegAssignee, setQuickDelegAssignee] = useState("");
+  const [quickDelegDeadline, setQuickDelegDeadline] = useState("");
   const [editingProjTask, setEditingProjTask] = useState(null); // { _pid, id, text, estimateMin }
   const [editingProjMemo, setEditingProjMemo] = useState(null); // proj task id
   const [projMemoText, setProjMemoText] = useState("");
 
-  // Quick timer (restored from localStorage)
-  const [qtRunning, setQtRunning] = useState(() => {
-    try { const s = localStorage.getItem("mkt_qt"); if (s) { const d = JSON.parse(s); return d.running || false; } } catch {} return false;
+  // Global timer state (restored from localStorage)
+  const [globalTimer, setGlobalTimer] = useState(() => {
+    try { const s = localStorage.getItem("stack_globalTimer"); if (s) return JSON.parse(s); } catch {}
+    return { running: false, startedAt: null, elapsed: 0, project: "", taskName: "" };
   });
-  const [qtStartedAt, setQtStartedAt] = useState(() => {
-    try { const s = localStorage.getItem("mkt_qt"); if (s) { const d = JSON.parse(s); return d.startedAt || null; } } catch {} return null;
-  });
-  const [qtCount, setQtCount] = useState(0);
 
   // All active tasks for "list" tab
   const [allActiveTasks, setAllActiveTasks] = useState([]);
@@ -158,15 +162,19 @@ export default function TaskManagementView({ onNavigateToClient }) {
     try { const s = localStorage.getItem("mkt_projTimers"); if (s) return JSON.parse(s); } catch {} return {};
   });
 
-  // Persist quick timer to localStorage
+  // Persist global timer to localStorage
   useEffect(() => {
-    localStorage.setItem("mkt_qt", JSON.stringify({ running: qtRunning, startedAt: qtStartedAt }));
-  }, [qtRunning, qtStartedAt]);
+    localStorage.setItem("stack_globalTimer", JSON.stringify(globalTimer));
+  }, [globalTimer]);
 
   // Persist project timers to localStorage
   useEffect(() => {
     localStorage.setItem("mkt_projTimers", JSON.stringify(projTimers));
+    projTimersRef.current = projTimers;
   }, [projTimers]);
+
+  // Keep dayTasks ref in sync
+  useEffect(() => { dayTasksRef.current = dayTasks; }, [dayTasks]);
 
   // Initialize projTimers from project task data (Supabase is source of truth)
   const projTimersInitialized = useRef(false);
@@ -175,15 +183,21 @@ export default function TaskManagementView({ onNavigateToClient }) {
     projTimersInitialized.current = true;
     setProjTimers((prev) => {
       const fromDb = {};
+      const validIds = new Set();
       for (const p of projects) {
         for (const t of (p.tasks || [])) {
+          validIds.add(t.id);
           if (t.elapsedSec > 0) {
             fromDb[t.id] = { running: false, startedAt: null, elapsed: t.elapsedSec };
           }
         }
       }
       // Merge: prefer higher elapsed value (Supabase or localStorage)
-      const merged = { ...prev };
+      const merged = {};
+      // ★ クリーンアップ: 存在するタスクのエントリだけ残す
+      for (const [k, v] of Object.entries(prev)) {
+        if (validIds.has(k) || v.running) merged[k] = v; // running は安全のため残す
+      }
       for (const [k, v] of Object.entries(fromDb)) {
         if (!merged[k] || (v.elapsed || 0) > (merged[k].elapsed || 0)) {
           merged[k] = v;
@@ -193,38 +207,66 @@ export default function TaskManagementView({ onNavigateToClient }) {
     });
   }, [projects]);
 
-  // Auto-save running project timers to tasks table every 60 seconds
+  // Auto-save ALL running timers to DB every 60 seconds (projTimers + dayTasks)
+  // ★ ref 経由でアクセスし依存配列を空にする → state変更でインターバルがリセットされない
   useEffect(() => {
-    const interval = setInterval(() => {
-      for (const [taskId, pt] of Object.entries(projTimers)) {
+    const saveAllRunningTimers = () => {
+      for (const [taskId, pt] of Object.entries(projTimersRef.current)) {
         if (pt.running && pt.startedAt) {
           const elapsed = (pt.elapsed || 0) + Math.floor((Date.now() - pt.startedAt) / 1000);
           updateTaskDB(taskId, { elapsedSec: elapsed });
         }
       }
-    }, 60000);
-    return () => clearInterval(interval);
-  }, [projTimers]);
-
-  // Save timer state when tab becomes hidden (sleep, screen lock, switch tabs)
-  useEffect(() => {
-    const handleVisibility = () => {
-      if (document.hidden) {
-        for (const [taskId, pt] of Object.entries(projTimers)) {
-          if (pt.running && pt.startedAt) {
-            const elapsed = (pt.elapsed || 0) + Math.floor((Date.now() - pt.startedAt) / 1000);
-            updateTaskDB(taskId, { elapsedSec: elapsed });
-          }
+      for (const t of dayTasksRef.current) {
+        if (t.running && t.runStartedAt) {
+          const elapsed = (t.elapsedSec || 0) + Math.floor((Date.now() - t.runStartedAt) / 1000);
+          updateTaskDB(t.id, { elapsedSec: elapsed });
         }
       }
     };
+    const interval = setInterval(saveAllRunningTimers, 60000);
+    const handleVisibility = () => { if (document.hidden) saveAllRunningTimers(); };
+    const handleUnload = () => saveAllRunningTimers();
     document.addEventListener("visibilitychange", handleVisibility);
-    return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, [projTimers]);
+    window.addEventListener("beforeunload", handleUnload);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("beforeunload", handleUnload);
+    };
+  }, []); // ★ 空依存 → 一度だけ生成、60秒ごとに確実に発火
+
+  // Auto-advance to new date at midnight
+  useEffect(() => {
+    const checkMidnight = () => {
+      const today = todayKey();
+      if (date !== today && date < today) {
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const yesterdayKey = yesterday.toISOString().slice(0, 10);
+        if (date === yesterdayKey) {
+          setDate(today);
+        }
+      }
+    };
+    const interval = setInterval(checkMidnight, 60000);
+    return () => clearInterval(interval);
+  }, [date]);
 
   // ── Data loading ──
   const loadDayTasks = useCallback(async () => {
     setLoadingTasks(true);
+    // ★ 差し替え前に走っているタイマーの実績をDBにチェックポイント保存（タイマーは止めない）
+    setDayTasks((prev) => {
+      for (const t of prev) {
+        if (t.running && t.runStartedAt) {
+          const elapsed = (t.elapsedSec || 0) + Math.floor((Date.now() - t.runStartedAt) / 1000);
+          // elapsed を保存し、runStartedAt をリセット（タイマー継続。再取得時にDBからrunning=trueで復元）
+          updateTaskDB(t.id, { elapsedSec: elapsed, runStartedAt: Date.now() });
+        }
+      }
+      return prev;
+    });
     // Fetch tasks for the date view: tasks added to this date + tasks with deadline ≤ this date
     const tasks = await fetchTasksForDateView(date);
     setDayTasks(tasks);
@@ -404,9 +446,22 @@ export default function TaskManagementView({ onNavigateToClient }) {
           const extra = t.runStartedAt ? Math.floor((Date.now() - t.runStartedAt) / 1000) : 0;
           const u = { ...t, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null };
           updateTaskDB(id, u);
+          // If midnight passed while timer was running, move task to today
+          const today = todayKey();
+          if (t.taskDate && t.taskDate < today) {
+            updateTaskDB(id, { taskDate: today });
+            u.taskDate = today;
+          }
           return u;
         } else {
+          // 排他制御: グローバルタイマーを一時停止
+          stopGlobalTimerSilent();
           const u = { ...t, running: true, runStartedAt: Date.now() };
+          // 繰越タスクのタイマー開始 → 今日に帰属させる
+          const today2 = todayKey();
+          if (t.taskDate && t.taskDate < today2) {
+            u.taskDate = today2;
+          }
           updateTaskDB(id, u);
           return u;
         }
@@ -428,6 +483,11 @@ export default function TaskManagementView({ onNavigateToClient }) {
       if (!t.done) {
         const extra = t.running && t.runStartedAt ? Math.floor((Date.now() - t.runStartedAt) / 1000) : 0;
         const u = { ...t, done: true, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null, completedAt: new Date().toISOString() };
+        // If midnight passed while timer was running, move task to today
+        const today = todayKey();
+        if (t.taskDate && t.taskDate < today) {
+          u.taskDate = today;
+        }
         updateTaskDB(id, u);
         if (u.linkId) syncTaskStatus(u.linkId, true);
         return u;
@@ -440,6 +500,28 @@ export default function TaskManagementView({ onNavigateToClient }) {
     setDayTasks(updated);
     // Also refresh the all-active list if it was loaded
     if (allActiveTasks.length > 0) loadAllActive();
+  };
+
+  // Quick-delegate: mark daily task done + create delegation task (進行中)
+  const submitQuickDeleg = async (taskId) => {
+    const task = dayTasks.find((t) => t.id === taskId);
+    if (!task) return;
+    // Mark the original task as done if not already
+    if (!task.done) {
+      await markDone(taskId);
+    }
+    // Use completion date (today) as the delegation task date
+    const completionDate = todayKey();
+    await insertTaskDB(completionDate, {
+      name: task.name, project: task.project || null,
+      assignee: quickDelegAssignee || null,
+      deadline: quickDelegDeadline ? toISO(quickDelegDeadline) : null,
+      taskType: "delegation", status: "inprogress",
+      linkId: "link-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+    });
+    await loadSpecialTasks();
+    setQuickDelegId(null); setQuickDelegAssignee(""); setQuickDelegDeadline("");
+    setToast("📤 依頼タスク（進行中）を作成しました");
   };
 
   const handleDeleteTask = async (id) => {
@@ -613,29 +695,81 @@ export default function TaskManagementView({ onNavigateToClient }) {
     setAiEstLoading(false);
   };
 
-  // Quick timer elapsed
-  const getQtElapsed = () => {
-    if (!qtRunning || !qtStartedAt) return 0;
-    return Math.floor((Date.now() - qtStartedAt) / 1000);
+  // Global timer functions
+  const getGlobalTimerElapsed = () => {
+    let base = globalTimer.elapsed || 0;
+    if (globalTimer.running && globalTimer.startedAt) {
+      base += Math.floor((Date.now() - globalTimer.startedAt) / 1000);
+    }
+    return base;
   };
 
-  // Total quick timer seconds for today
-  const qtTotalSec = useMemo(() => {
-    return dayTasks.filter((t) => t.name && t.name.includes("チャット・雑務") && t.done).reduce((s, t) => s + (t.elapsedSec || 0), 0);
-  }, [dayTasks]);
-
-  const qtToggle = async () => {
-    if (qtRunning) {
-      const elapsed = qtStartedAt ? Math.floor((Date.now() - qtStartedAt) / 1000) : 0;
-      setQtRunning(false); setQtStartedAt(null);
-      if (elapsed > 60) {
-        const num = qtCount + 1;
-        setQtCount(num);
-        await insertTaskDB(date, { name: `💬 ${num} チャット・雑務`, estimateSec: elapsed, elapsedSec: elapsed, done: true, taskType: "daily", deadline: date + "T00:00:00", completedAt: new Date().toISOString() });
+  const globalTimerToggle = async () => {
+    if (globalTimer.running) {
+      const elapsed = getGlobalTimerElapsed();
+      if (elapsed > 30) {
+        const taskName = globalTimer.taskName || "作業";
+        const project = globalTimer.project || null;
+        const today = todayKey();
+        await insertTaskDB(today, {
+          name: taskName,
+          estimateSec: elapsed,
+          elapsedSec: elapsed,
+          done: true,
+          taskType: "daily",
+          project: project,
+          clientName: project,
+          deadline: today + "T00:00:00",
+          completedAt: new Date().toISOString(),
+        });
         await loadDayTasks();
+        setToast(`✅ ${fmtSec(elapsed)} 記録: ${taskName}${project ? ` [${project}]` : ""}`);
       }
+      setGlobalTimer({ running: false, startedAt: null, elapsed: 0, project: "", taskName: "" });
     } else {
-      setQtRunning(true); setQtStartedAt(Date.now());
+      // 排他制御: 個別タイマーを全停止してからグローバルタイマー開始
+      stopAllTaskTimers();
+      setGlobalTimer({ ...globalTimer, running: true, startedAt: Date.now() });
+    }
+  };
+
+  const globalTimerDiscard = () => {
+    setGlobalTimer({ running: false, startedAt: null, elapsed: 0, project: "", taskName: "" });
+  };
+
+  // ── 排他制御: 全個別タイマーを停止 ──
+  const stopAllTaskTimers = () => {
+    // projTimers (進行中タスク)
+    const next = {};
+    for (const [k, v] of Object.entries(projTimers)) {
+      if (v.running) {
+        const extra = v.startedAt ? Math.floor((Date.now() - v.startedAt) / 1000) : 0;
+        const newElapsed = (v.elapsed || 0) + extra;
+        next[k] = { running: false, startedAt: null, elapsed: newElapsed };
+        persistProjElapsed(null, k, newElapsed);
+      } else {
+        next[k] = v;
+      }
+    }
+    setProjTimers(next);
+    // dayTasks (日次タスク)
+    setDayTasks((prev) => prev.map((t) => {
+      if (t.running && t.runStartedAt) {
+        const extra = Math.floor((Date.now() - t.runStartedAt) / 1000);
+        const u = { ...t, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null };
+        updateTaskDB(t.id, u);
+        return u;
+      }
+      return t;
+    }));
+  };
+
+  // ── 排他制御: グローバルタイマーを停止（記録せず） ──
+  const stopGlobalTimerSilent = () => {
+    if (globalTimer.running) {
+      // 累積時間をグローバルタイマーに保持（タスクタイマーに切り替えただけなので記録はしない）
+      const elapsed = getGlobalTimerElapsed();
+      setGlobalTimer({ ...globalTimer, running: false, startedAt: null, elapsed });
     }
   };
 
@@ -662,6 +796,8 @@ export default function TaskManagementView({ onNavigateToClient }) {
       setProjTimers((prev) => ({ ...prev, [taskId]: { running: false, startedAt: null, elapsed: newElapsed } }));
       persistProjElapsed(projId, taskId, newElapsed);
     } else {
+      // 排他制御: グローバルタイマーを一時停止
+      stopGlobalTimerSilent();
       // Starting - stop other running timers and persist their elapsed
       const next = {};
       for (const [k, v] of Object.entries(projTimers)) {
@@ -676,6 +812,13 @@ export default function TaskManagementView({ onNavigateToClient }) {
       }
       next[taskId] = { running: true, startedAt: Date.now(), elapsed: pt.elapsed || 0 };
       setProjTimers(next);
+      // 繰越タスクのタイマー開始 → 今日に帰属させる
+      const today = todayKey();
+      const task = todayProjTasks.find((t) => t.id === taskId);
+      if (task && task.taskDate && task.taskDate < today) {
+        updateTaskDB(taskId, { taskDate: today });
+        setTodayProjTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, taskDate: today } : t));
+      }
     }
   };
 
@@ -685,10 +828,13 @@ export default function TaskManagementView({ onNavigateToClient }) {
     if (!task) return;
     const newDone = !task.done;
     const completedAt = newDone ? new Date().toISOString() : null;
+    // 今日やったタスクは今日に帰属させる（繰越タスクのtask_dateを今日に移動）
+    const today = todayKey();
+    const moveToToday = newDone && task.taskDate && task.taskDate < today;
     // Optimistic update
-    setTodayProjTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, done: newDone, completedAt } : t));
+    setTodayProjTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, done: newDone, completedAt, ...(moveToToday ? { taskDate: today } : {}) } : t));
     // Persist to tasks table (source of truth)
-    await updateTaskDB(taskId, { done: newDone, completedAt });
+    await updateTaskDB(taskId, { done: newDone, completedAt, ...(moveToToday ? { taskDate: today } : {}) });
     // Sync JSONB + tasks state for cross-view compatibility
     if (task.linkId) syncTaskStatus(task.linkId, newDone);
   };
@@ -892,6 +1038,66 @@ export default function TaskManagementView({ onNavigateToClient }) {
         </div>
       </div>
 
+      {/* ═══ GLOBAL TIMER ═══ */}
+      <Card style={{
+        padding: "10px 14px",
+        border: `1px solid ${globalTimer.running ? T.accent + "66" : T.border}`,
+        background: globalTimer.running ? T.accent + "08" : T.bgCard,
+        position: "sticky", top: 50, zIndex: 10,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 18 }}>⏱</span>
+          <select
+            value={globalTimer.project}
+            onChange={(e) => setGlobalTimer({ ...globalTimer, project: e.target.value })}
+            disabled={globalTimer.running}
+            style={{
+              padding: "5px 8px", fontSize: 11, background: T.bgInput, color: T.text,
+              border: `1px solid ${T.border}`, borderRadius: T.radiusSm, fontFamily: T.font,
+              minWidth: 100, opacity: globalTimer.running ? 0.6 : 1,
+            }}
+          >
+            <option value="">案件</option>
+            {projectNames.map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+          <input
+            value={globalTimer.taskName}
+            onChange={(e) => setGlobalTimer({ ...globalTimer, taskName: e.target.value })}
+            disabled={globalTimer.running}
+            placeholder="施策名"
+            style={{
+              flex: 1, minWidth: 100, padding: "5px 8px", fontSize: 12,
+              background: T.bgInput, color: T.text, border: `1px solid ${T.border}`,
+              borderRadius: T.radiusSm, fontFamily: T.font, outline: "none",
+              opacity: globalTimer.running ? 0.6 : 1,
+            }}
+          />
+          <div style={{
+            fontSize: 22, fontWeight: 700, fontVariantNumeric: "tabular-nums",
+            fontFamily: "'SF Mono','Menlo',monospace",
+            color: globalTimer.running ? T.accent : T.textMuted,
+            minWidth: 70, textAlign: "right", letterSpacing: 1,
+          }}>
+            {fmtSec(getGlobalTimerElapsed())}
+          </div>
+          <button onClick={globalTimerToggle} style={{
+            width: 44, height: 44, borderRadius: "50%",
+            border: `2px solid ${globalTimer.running ? T.error : T.accent}`,
+            background: globalTimer.running ? T.error + "15" : T.accent + "15",
+            cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 18, flexShrink: 0, transition: "all 0.2s",
+          }}>
+            {globalTimer.running ? "⏹" : "▶"}
+          </button>
+          {(globalTimer.running || globalTimer.elapsed > 0) && (
+            <button onClick={globalTimerDiscard} title="破棄" style={{
+              background: "none", border: "none", cursor: "pointer",
+              fontSize: 12, color: T.textDim, opacity: 0.5,
+            }}>🗑</button>
+          )}
+        </div>
+      </Card>
+
       {/* ═══ TODAY TAB ═══ */}
       {tmTab === "today" && <>
         {/* Date navigation */}
@@ -963,27 +1169,6 @@ export default function TaskManagementView({ onNavigateToClient }) {
           </Card>
         </div>
 
-        {/* ── チャット・雑務 Card (always visible on today) ── */}
-        {date === todayKey() && (
-          <Card style={{ padding: "12px 16px", border: `1px solid ${qtRunning ? T.warning + "66" : T.warning + "22"}`, background: qtRunning ? T.warning + "08" : T.bgCard }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <span style={{ fontSize: 20 }}>💬</span>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 14, fontWeight: 600, color: T.text }}>チャットの返信・雑務</div>
-                <div style={{ fontSize: 11, color: T.textMuted, marginTop: 2 }}>
-                  {qtRunning ? "計測中..." : "▶で開始 → ⏹で停止してタスクに記録"}
-                  {qtTotalSec > 0 && !qtRunning && <span style={{ marginLeft: 8, color: T.warning }}>本日合計: {fmtSec(qtTotalSec)}</span>}
-                </div>
-              </div>
-              <div style={{ fontSize: 24, fontWeight: 700, fontVariantNumeric: "tabular-nums", fontFamily: "'SF Mono','Menlo',monospace", color: qtRunning ? T.warning : T.textMuted, minWidth: 70, textAlign: "right", letterSpacing: 1 }}>
-                {fmtSec(getQtElapsed())}
-              </div>
-              <button onClick={qtToggle} style={{ width: 48, height: 48, borderRadius: "50%", border: `2px solid ${qtRunning ? T.error : T.warning}`, background: qtRunning ? T.error + "15" : T.warning + "15", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0, transition: "all 0.2s" }}>
-                {qtRunning ? "⏹" : "▶"}
-              </button>
-            </div>
-          </Card>
-        )}
 
         {loadingTasks && <div style={{ textAlign: "center", color: T.textMuted, fontSize: 13, padding: 16 }}>読み込み中...</div>}
 
@@ -1100,6 +1285,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
                   {/* Actions */}
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    <button onClick={() => { setQuickDelegId(quickDelegId === task.id ? null : task.id); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} title="依頼転送" style={{ background: "none", border: "none", color: quickDelegId === task.id ? T.accent : T.textDim, cursor: "pointer", fontSize: 10, opacity: quickDelegId === task.id ? 1 : 0.5 }}>📤</button>
                     <button onClick={() => setEditingTask({ id: task.id, name: task.name, project: task.project, estimateMin: Math.round((task.estimateSec || 0) / 60), elapsedMin: Math.round(elapsed / 60) })} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.5 }}>✏️</button>
                     <button onClick={() => { setEditingMemo(task.id); setMemoText(task.memo || ""); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.5 }}>📝</button>
                     <button onClick={() => handleDeleteTask(task.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
@@ -1132,6 +1318,19 @@ export default function TaskManagementView({ onNavigateToClient }) {
                     <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
                       <Btn onClick={() => saveMemo(task.id)} style={{ fontSize: 10, padding: "3px 10px" }}>保存</Btn>
                       <Btn variant="ghost" onClick={() => setEditingMemo(null)} style={{ fontSize: 10, padding: "3px 8px" }}>✕</Btn>
+                    </div>
+                  </div>
+                )}
+
+                {/* Quick delegate */}
+                {quickDelegId === task.id && (
+                  <div style={{ padding: "8px 12px", borderTop: `1px solid ${T.accent}44`, background: T.accent + "06" }}>
+                    <div style={{ fontSize: 10, fontWeight: 600, color: T.accent, marginBottom: 6 }}>📤 依頼転送（進行中で作成）</div>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                      <input value={quickDelegAssignee} onChange={(e) => setQuickDelegAssignee(e.target.value)} placeholder="依頼先" style={{ flex: 1, minWidth: 80, padding: "5px 8px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} autoFocus />
+                      <input value={quickDelegDeadline} onChange={(e) => setQuickDelegDeadline(e.target.value)} placeholder="期限 MM/DD" style={{ width: 80, padding: "5px 8px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} onKeyDown={(e) => { if (e.key === "Enter") submitQuickDeleg(task.id); }} />
+                      <Btn onClick={() => submitQuickDeleg(task.id)} style={{ fontSize: 10, padding: "4px 10px" }}>転送</Btn>
+                      <Btn variant="ghost" onClick={() => { setQuickDelegId(null); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} style={{ fontSize: 10, padding: "4px 8px" }}>✕</Btn>
                     </div>
                   </div>
                 )}
@@ -1204,8 +1403,21 @@ export default function TaskManagementView({ onNavigateToClient }) {
                             {task.project && <span style={{ fontSize: 9, color: T.textDim, marginLeft: 6 }}>[{truncate(task.project, 12)}]</span>}
                           </div>
                           <span style={{ fontSize: 14, fontWeight: 600, fontVariantNumeric: "tabular-nums", fontFamily: "'SF Mono', monospace", color: T.success }}>{fmtSec(elapsed)}</span>
+                          <button onClick={(e) => { e.stopPropagation(); setQuickDelegId(quickDelegId === task.id ? null : task.id); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} title="依頼転送" style={{ background: "none", border: "none", color: quickDelegId === task.id ? T.accent : T.textDim, cursor: "pointer", fontSize: 11, opacity: quickDelegId === task.id ? 1 : 0.5, padding: "2px 4px" }}>📤</button>
                           <span style={{ fontSize: 11, color: T.textDim }}>✏️</span>
                         </div>
+                        {/* Quick delegate inline form */}
+                        {quickDelegId === task.id && (
+                          <div style={{ padding: "8px 12px", borderTop: `1px solid ${T.accent}44`, background: T.accent + "06" }} onClick={(e) => e.stopPropagation()}>
+                            <div style={{ fontSize: 10, fontWeight: 600, color: T.accent, marginBottom: 6 }}>📤 依頼転送（進行中で作成）</div>
+                            <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                              <input value={quickDelegAssignee} onChange={(e) => setQuickDelegAssignee(e.target.value)} placeholder="依頼先" style={{ flex: 1, minWidth: 80, padding: "5px 8px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} autoFocus />
+                              <input value={quickDelegDeadline} onChange={(e) => setQuickDelegDeadline(e.target.value)} placeholder="期限 MM/DD" style={{ width: 80, padding: "5px 8px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} onKeyDown={(e) => { if (e.key === "Enter") submitQuickDeleg(task.id); }} />
+                              <Btn onClick={() => submitQuickDeleg(task.id)} style={{ fontSize: 10, padding: "4px 10px" }}>転送</Btn>
+                              <Btn variant="ghost" onClick={() => { setQuickDelegId(null); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} style={{ fontSize: 10, padding: "4px 8px" }}>✕</Btn>
+                            </div>
+                          </div>
+                        )}
                         {editingTask?.id === task.id && (
                           <div style={{ padding: "8px 12px", borderTop: `1px solid ${T.border}`, background: T.bg, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
                             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -1604,7 +1816,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
             <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
               {[
                 { id: "all", label: "全て", count: selfCount + otherCount },
-                { id: "self", label: "🏀 自分ボール", count: selfCount },
+                { id: "self", label: "👤 自分ボール", count: selfCount },
                 { id: "other", label: "👥 他人ボール", count: otherCount },
               ].map((f) => (
                 <button key={f.id} onClick={() => setInprogFilter(f.id)} style={{

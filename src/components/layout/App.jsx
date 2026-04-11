@@ -6,12 +6,10 @@ import QuickTaskFab from "../ui/QuickTaskFab";
 import SheetSyncBadge from "../ui/SheetSyncBadge";
 import TaskManagementView from "../tasks/TaskManagementView";
 import ClientDashboardView from "../clients/ClientDashboardView";
-import SettingsView from "../settings/SettingsView";
 
 const TABS = [
   { id: "task", label: "⏱ タスク管理" },
   { id: "clients", label: "🏥 クライアント" },
-  { id: "settings", label: "⚙️ 設定" },
 ];
 
 export default function Stack() {
@@ -85,7 +83,6 @@ export default function Stack() {
       <div style={{ flex: 1, padding: "12px 16px", maxWidth: 860, width: "100%", margin: "0 auto" }}>
         {view === "task" && <TaskManagementView onNavigateToClient={navigateToClient} />}
         {view === "clients" && <ClientDashboardView initialClientName={initialClientName} onClearInitial={() => setInitialClientName(null)} />}
-        {view === "settings" && <SettingsView />}
       </div>
 
       {/* Toast */}
