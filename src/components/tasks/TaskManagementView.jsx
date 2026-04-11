@@ -483,9 +483,9 @@ export default function TaskManagementView({ onNavigateToClient }) {
       if (!t.done) {
         const extra = t.running && t.runStartedAt ? Math.floor((Date.now() - t.runStartedAt) / 1000) : 0;
         const u = { ...t, done: true, running: false, elapsedSec: (t.elapsedSec || 0) + extra, runStartedAt: null, completedAt: new Date().toISOString() };
-        // If midnight passed while timer was running, move task to today
+        // 完了日（今日）にタスクを移動（��に完了日ベースで管理）
         const today = todayKey();
-        if (t.taskDate && t.taskDate < today) {
+        if (t.taskDate !== today) {
           u.taskDate = today;
         }
         updateTaskDB(id, u);
