@@ -362,8 +362,21 @@ export default function ClientDashboardView({ initialClientName, onClearInitial 
   if (sel) {
     const cc = CAT_COLORS[(sel.services || [sel.category])[0]] || CAT_COLORS["SEO"];
     const svcs = sel.services || [sel.category];
-    const openTasks = clientTasks.filter((t) => !t.done).sort((a, b) => (a.deadline || "9999") > (b.deadline || "9999") ? 1 : -1);
-    const doneTasks = clientTasks.filter((t) => t.done);
+    // タスクリストは SEO 施策のみ (daily/inprogress/delegation) に限定。記事・レポートは別セクション
+    const seoTaskTypes = new Set(["daily", "inprogress", "delegation", null, undefined, ""]);
+    const seoTasks = clientTasks.filter((t) => seoTaskTypes.has(t.taskType));
+    const articleTasks = clientTasks.filter((t) => t.taskType === "article");
+    const openTasks = seoTasks.filter((t) => !t.done).sort((a, b) => (a.deadline || "9999") > (b.deadline || "9999") ? 1 : -1);
+    const doneTasks = seoTasks.filter((t) => t.done);
+    // 記事進捗サマリー
+    const ART_DONE = "入稿完了";
+    const articleStatusCount = {};
+    articleTasks.forEach((a) => {
+      const s = (a.status || "").trim() || "未着手";
+      articleStatusCount[s] = (articleStatusCount[s] || 0) + 1;
+    });
+    const articleTotal = articleTasks.length;
+    const articleDone = articleTasks.filter((a) => (a.status || "").trim() === ART_DONE).length;
 
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -534,6 +547,66 @@ export default function ClientDashboardView({ initialClientName, onClearInitial 
             </details>
           )}
         </Card>
+
+        {/* 記事進捗（記事管理シート） */}
+        {articleTotal > 0 && (() => {
+          const statusColors = {
+            "未着手": T.textMuted,
+            "構成中": T.cyan,
+            "構成完了": T.warning,
+            "承認済み": T.purple,
+            "執筆中": T.accent,
+            "執筆完了": "#EC4899",
+            "チェック済み": T.green,
+            "入稿完了": T.success,
+          };
+          const statusOrder = ["未着手", "構成中", "構成完了", "承認済み", "執筆中", "執筆完了", "チェック済み", "入稿完了"];
+          const pct = articleTotal > 0 ? Math.round((articleDone / articleTotal) * 100) : 0;
+          return (
+            <Card style={{ borderLeft: `3px solid ${T.purple}`, padding: 12 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: T.text }}>📝 記事進捗</div>
+                <div style={{ fontSize: 11, color: T.textMuted }}>{articleDone} / {articleTotal} 件入稿完了（{pct}%）</div>
+              </div>
+              {/* プログレスバー */}
+              <div style={{ height: 4, background: T.border, borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
+                <div style={{ height: 4, background: T.success, width: `${pct}%`, transition: "width 0.3s" }} />
+              </div>
+              {/* ステータス別件数 */}
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
+                {statusOrder.map((s) => {
+                  const n = articleStatusCount[s] || 0;
+                  if (n === 0) return null;
+                  const c = statusColors[s] || T.textMuted;
+                  return <span key={s} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 99, background: c + "15", color: c, fontWeight: 600, border: `1px solid ${c}33` }}>{s} {n}</span>;
+                })}
+              </div>
+              {/* 記事リスト */}
+              <details>
+                <summary style={{ fontSize: 10, color: T.textMuted, cursor: "pointer", padding: "3px 0" }}>▶ 記事一覧を表示</summary>
+                <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 6 }}>
+                  {articleTasks
+                    .slice()
+                    .sort((a, b) => {
+                      const aIdx = statusOrder.indexOf((a.status || "").trim() || "未着手");
+                      const bIdx = statusOrder.indexOf((b.status || "").trim() || "未着手");
+                      return aIdx - bIdx;
+                    })
+                    .map((a) => {
+                      const s = (a.status || "").trim() || "未着手";
+                      const c = statusColors[s] || T.textMuted;
+                      return (
+                        <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 0", borderBottom: `1px solid ${T.border}22` }}>
+                          <span style={{ fontSize: 8, padding: "1px 6px", borderRadius: 99, background: c + "15", color: c, fontWeight: 600, flexShrink: 0, minWidth: 56, textAlign: "center" }}>{s}</span>
+                          <span style={{ flex: 1, fontSize: 11, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.name || a.kw}</span>
+                        </div>
+                      );
+                    })}
+                </div>
+              </details>
+            </Card>
+          );
+        })()}
 
         {/* In-progress tasks for this client */}
         {(() => {
