@@ -240,6 +240,12 @@ export default function TaskManagementView({ onNavigateToClient }) {
   useEffect(() => {
     const checkMidnight = () => {
       const today = todayKey();
+      // 走っているタイマーのタスクを新しい日付に移動（日付に関わらず毎回チェック）
+      for (const t of dayTasksRef.current) {
+        if (t.running && t.taskDate && t.taskDate < today) {
+          updateTaskDB(t.id, { taskDate: today });
+        }
+      }
       if (date !== today && date < today) {
         const yesterday = new Date();
         yesterday.setDate(yesterday.getDate() - 1);
