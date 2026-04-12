@@ -1350,11 +1350,16 @@ export default function TaskManagementView({ onNavigateToClient }) {
           const doneProjTasks = regularProjTasks.filter(t => t.done);
           const totalDone = doneTasks.length + doneProjTasks.length;
           if (totalDone === 0) return null;
-          // シート由来かつ完了タスクをClaude Code報告用にコピー
+          // 「施策管理」シート由来の完了タスクをClaude Code報告用にコピー
+          // 施策管理: task_type = daily/inprogress/delegation (article/report は除外)
           const copySheetDoneReport = () => {
-            const sheetDone = [...doneTasks, ...doneProjTasks].filter(t => t.sheetKey);
+            const sheetDone = [...doneTasks, ...doneProjTasks].filter(t => {
+              if (!t.sheetKey) return false;
+              const tt = t.taskType || "daily";
+              return tt === "daily" || tt === "inprogress" || tt === "delegation";
+            });
             if (sheetDone.length === 0) {
-              setToast("⚠️ シート由来の完了タスクがありません");
+              setToast("⚠️ 施策管理シートの完了タスクがありません");
               return;
             }
             const lines = sheetDone.map(t => {
