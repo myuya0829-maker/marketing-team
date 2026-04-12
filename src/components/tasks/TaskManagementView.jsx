@@ -1350,12 +1350,34 @@ export default function TaskManagementView({ onNavigateToClient }) {
           const doneProjTasks = regularProjTasks.filter(t => t.done);
           const totalDone = doneTasks.length + doneProjTasks.length;
           if (totalDone === 0) return null;
+          // シート由来かつ完了タスクをClaude Code報告用にコピー
+          const copySheetDoneReport = () => {
+            const sheetDone = [...doneTasks, ...doneProjTasks].filter(t => t.sheetKey);
+            if (sheetDone.length === 0) {
+              setToast("⚠️ シート由来の完了タスクがありません");
+              return;
+            }
+            const lines = sheetDone.map(t => {
+              const name = t.name || t.text || "";
+              const client = t.project || t._pname || "";
+              const elapsed = getElapsed(t);
+              const timeStr = elapsed > 0 ? ` ${fmtSec(elapsed)}` : "";
+              return client ? `- [${client}] ${name}${timeStr}` : `- ${name}${timeStr}`;
+            });
+            const header = `## ${date} の完了施策（${sheetDone.length}件）\n`;
+            navigator.clipboard.writeText(header + lines.join("\n")).then(() => {
+              setToast(`📋 ${sheetDone.length}件をコピーしました`);
+            });
+          };
           return (
             <div>
-              <button onClick={() => setDoneSectionOpen(!doneSectionOpen)} style={{ width: "100%", display: "flex", alignItems: "center", gap: 6, padding: "8px 4px", background: "none", border: "none", cursor: "pointer", fontFamily: T.font }}>
-                <span style={{ fontSize: 10, color: T.success, transition: "transform 0.2s", transform: doneSectionOpen ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>
-                <span style={{ fontSize: 11, fontWeight: 600, color: T.success }}>✅ 完了タスク（{totalDone}）</span>
-              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <button onClick={() => setDoneSectionOpen(!doneSectionOpen)} style={{ flex: 1, display: "flex", alignItems: "center", gap: 6, padding: "8px 4px", background: "none", border: "none", cursor: "pointer", fontFamily: T.font }}>
+                  <span style={{ fontSize: 10, color: T.success, transition: "transform 0.2s", transform: doneSectionOpen ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: T.success }}>✅ 完了タスク（{totalDone}）</span>
+                </button>
+                <button onClick={copySheetDoneReport} title="シート由来の完了施策をClaude Code報告用にコピー" style={{ padding: "4px 10px", fontSize: 10, background: T.success + "22", color: T.success, border: `1px solid ${T.success}44`, borderRadius: T.radiusXs, cursor: "pointer", fontFamily: T.font, fontWeight: 600, flexShrink: 0 }}>📋 施策コピー</button>
+              </div>
               {doneSectionOpen && (
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   {doneProjTasks.map((t) => {
