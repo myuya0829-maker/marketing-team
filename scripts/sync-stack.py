@@ -460,24 +460,27 @@ ARTICLE_STATUS_ORDER = ["構成中", "構成完了", "承認済み", "執筆中"
 
 
 def make_article_key(sheet_row):
-    """記事の自然キー: 'article::{月}::{クライアント}::{KW}'"""
+    """記事の自然キー: 'article::{月}::{クライアント}::{KW or row_num}'"""
     month = sheet_row.get("月", "").strip()
     client = sheet_row.get("クライアント", "").strip()
     kw = sheet_row.get("KW", "").strip()
-    return f"{ARTICLE_KEY_PREFIX}{month}::{client}::{kw}"
+    # KW 空の場合は row_num で一意化（未着手スロットを識別するため）
+    identifier = kw if kw else f"(空枠:row{sheet_row.get('row_num', '?')})"
+    return f"{ARTICLE_KEY_PREFIX}{month}::{client}::{identifier}"
 
 
 def article_row_to_task(sheet_row, now_iso):
     """記事管理 sheet row → tasks 行 (view-only, sheet が真実)"""
     status = sheet_row.get("ステータス", "").strip()
     is_done = (status == "入稿完了")
+    kw = sheet_row.get("KW", "").strip()
     return {
         "user_id": USER_ID,
         "task_type": "article",
         "sheet_key": make_article_key(sheet_row),
         "sheet_row_num": sheet_row.get("row_num"),
         "sheet_synced_at": now_iso,
-        "name": sheet_row.get("KW", "") or "",
+        "name": kw or "(未着手)",
         "client_name": sheet_row.get("クライアント", "") or None,
         "project": sheet_row.get("クライアント", "") or None,
         "assignee": sheet_row.get("担当", "") or None,
@@ -721,7 +724,8 @@ def sync_articles(env, access_token, existing_all, now_iso):
     sheet_map = {}
     dupes = 0
     for r in all_rows:
-        if not r.get("KW", "").strip() or not r.get("クライアント", "").strip():
+        # KW 空でも「未着手」として同期する（クライアント名は必須）
+        if not r.get("クライアント", "").strip():
             continue
         key = make_article_key(r)
         if key in sheet_map:
