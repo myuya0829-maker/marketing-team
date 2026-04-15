@@ -509,14 +509,13 @@ export default function TaskManagementView({ onNavigateToClient }) {
   };
 
   // Quick-delegate: mark daily task done + create delegation task (進行中)
+  // 元タスクの memo に「📤→{依頼先}〆{期限}」マーカーを記録（既存メモは保持）
   const submitQuickDeleg = async (taskId) => {
     const task = dayTasks.find((t) => t.id === taskId);
     if (!task) return;
-    // Mark the original task as done if not already
     if (!task.done) {
       await markDone(taskId);
     }
-    // Use completion date (today) as the delegation task date
     const completionDate = todayKey();
     await insertTaskDB(completionDate, {
       name: task.name, project: task.project || null,
@@ -525,6 +524,16 @@ export default function TaskManagementView({ onNavigateToClient }) {
       taskType: "delegation", status: "inprogress",
       linkId: "link-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
     });
+    // 元タスクに転送マーカーを memo の先頭に記録
+    const dlStr = quickDelegDeadline || "—";
+    const asStr = quickDelegAssignee || "—";
+    const marker = `📤→${asStr}〆${dlStr}`;
+    const existingMemo = (task.memo || "").trim();
+    const newMemo = existingMemo
+      ? (existingMemo.includes("📤→") ? existingMemo : `${marker} | ${existingMemo}`)
+      : marker;
+    setDayTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, memo: newMemo } : t));
+    await updateTaskDB(taskId, { memo: newMemo });
     await loadSpecialTasks();
     setQuickDelegId(null); setQuickDelegAssignee(""); setQuickDelegDeadline("");
     setToast("📤 依頼タスク（進行中）を作成しました");
@@ -1357,7 +1366,8 @@ export default function TaskManagementView({ onNavigateToClient }) {
           const totalDone = doneTasks.length + doneProjTasks.length;
           if (totalDone === 0) return null;
           // 「施策管理」シート由来の完了タスクをClaude Code報告用にコピー
-          // 施策管理: task_type = daily/inprogress/delegation (article/report は除外)
+          // ① 完了タスク (memo に 📤→ がない)
+          // ② 進行中に転送したタスク (memo の先頭に 📤→{依頼先}〆{期限})
           const copySheetDoneReport = () => {
             const sheetDone = [...doneTasks, ...doneProjTasks].filter(t => {
               if (!t.sheetKey) return false;
@@ -1368,16 +1378,39 @@ export default function TaskManagementView({ onNavigateToClient }) {
               setToast("⚠️ 施策管理シートの完了タスクがありません");
               return;
             }
-            const lines = sheetDone.map(t => {
+            const isTransferred = (t) => (t.memo || "").trim().startsWith("📤→");
+            const completed = sheetDone.filter(t => !isTransferred(t));
+            const transferred = sheetDone.filter(isTransferred);
+            const fmtTaskLine = (t) => {
               const name = t.name || t.text || "";
               const client = t.project || t._pname || "";
               const elapsed = getElapsed(t);
               const timeStr = elapsed > 0 ? ` ${fmtSec(elapsed)}` : "";
               return client ? `- [${client}] ${name}${timeStr}` : `- ${name}${timeStr}`;
-            });
-            const header = `## ${date} の完了施策（${sheetDone.length}件）\n`;
-            navigator.clipboard.writeText(header + lines.join("\n")).then(() => {
-              setToast(`📋 ${sheetDone.length}件をコピーしました`);
+            };
+            const fmtTransferredLine = (t) => {
+              const name = t.name || t.text || "";
+              const client = t.project || t._pname || "";
+              // memo の先頭から 📤→{依頼先}〆{期限} を抽出
+              const m = (t.memo || "").match(/📤→([^〆|]+)〆([^|]+)/);
+              const assignee = m ? m[1].trim() : "—";
+              const deadline = m ? m[2].trim() : "—";
+              return client
+                ? `- [${client}] ${name}（→${assignee} 〆${deadline}）`
+                : `- ${name}（→${assignee} 〆${deadline}）`;
+            };
+            const sections = [];
+            sections.push(`## ${date} の作業報告`);
+            if (completed.length > 0) {
+              sections.push(`\n### ① 完了タスク（${completed.length}件）`);
+              sections.push(completed.map(fmtTaskLine).join("\n"));
+            }
+            if (transferred.length > 0) {
+              sections.push(`\n### ② 進行中に転送（${transferred.length}件）`);
+              sections.push(transferred.map(fmtTransferredLine).join("\n"));
+            }
+            navigator.clipboard.writeText(sections.join("\n")).then(() => {
+              setToast(`📋 完了${completed.length}件 + 転送${transferred.length}件をコピーしました`);
             });
           };
           return (
@@ -1432,6 +1465,12 @@ export default function TaskManagementView({ onNavigateToClient }) {
                         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", cursor: "pointer" }} onClick={openEdit}>
                           <button onClick={(e) => { e.stopPropagation(); markDone(task.id); }} style={{ width: 20, height: 20, borderRadius: "50%", border: `2px solid ${T.success}`, background: T.success + "22", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: T.success, flexShrink: 0 }}>✓</button>
                           <div style={{ flex: 1, minWidth: 0 }}>
+                            {(task.memo || "").trim().startsWith("📤→") && (() => {
+                              const m = (task.memo || "").match(/📤→([^〆|]+)〆([^|]+)/);
+                              const assignee = m ? m[1].trim() : "—";
+                              const deadline = m ? m[2].trim() : "—";
+                              return <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: T.accent + "22", color: T.accent, marginRight: 6, fontWeight: 600 }}>📤 {assignee} 〆{deadline}</span>;
+                            })()}
                             <span style={{ fontSize: 12, color: T.textMuted, textDecoration: "line-through" }}>{task.name}</span>
                             {task.project && <span style={{ fontSize: 9, color: T.textDim, marginLeft: 6 }}>[{truncate(task.project, 12)}]</span>}
                           </div>
