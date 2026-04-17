@@ -508,33 +508,49 @@ export default function TaskManagementView({ onNavigateToClient }) {
     if (allActiveTasks.length > 0) loadAllActive();
   };
 
-  // Quick-delegate: mark daily task done + create delegation task (進行中)
-  // 元タスクの memo に「📤→{依頼先}〆{期限}」マーカーを記録（既存メモは保持）
+  // Quick-delegate: mark task done + create delegation task (進行中)
+  // dayTasks / regularProjTasks の両方に対応
   const submitQuickDeleg = async (taskId) => {
-    const task = dayTasks.find((t) => t.id === taskId);
+    const dayTask = dayTasks.find((t) => t.id === taskId);
+    const projTask = !dayTask ? regularProjTasks.find((t) => t.id === taskId) : null;
+    const task = dayTask || projTask;
     if (!task) return;
+    const name = task.name || task.text || "";
+    const project = task.project || task._pname || null;
+    const existingMemo = (task.memo || "").trim();
+
+    // 元タスクを完了化
     if (!task.done) {
-      await markDone(taskId);
+      if (dayTask) {
+        await markDone(taskId);
+      } else {
+        await updateTaskDB(taskId, { done: true, completedAt: new Date().toISOString() });
+      }
     }
+
+    // 依頼タスク（進行中）を新規作成
     const completionDate = todayKey();
     await insertTaskDB(completionDate, {
-      name: task.name, project: task.project || null,
+      name, project,
       assignee: quickDelegAssignee || null,
       deadline: quickDelegDeadline ? toISO(quickDelegDeadline) : null,
       taskType: "delegation", status: "inprogress",
       linkId: "link-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
     });
+
     // 元タスクに転送マーカーを memo の先頭に記録
     const dlStr = quickDelegDeadline || "—";
     const asStr = quickDelegAssignee || "—";
     const marker = `📤→${asStr}〆${dlStr}`;
-    const existingMemo = (task.memo || "").trim();
     const newMemo = existingMemo
       ? (existingMemo.includes("📤→") ? existingMemo : `${marker} | ${existingMemo}`)
       : marker;
-    setDayTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, memo: newMemo } : t));
+    if (dayTask) {
+      setDayTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, memo: newMemo } : t));
+    }
     await updateTaskDB(taskId, { memo: newMemo });
     await loadSpecialTasks();
+    if (projTask) await loadProjTasksForDate();
     setQuickDelegId(null); setQuickDelegAssignee(""); setQuickDelegDeadline("");
     setToast("📤 依頼タスク（進行中）を作成しました");
   };
@@ -1235,11 +1251,24 @@ export default function TaskManagementView({ onNavigateToClient }) {
                       <button onClick={() => { setProjTimers((prev) => ({ ...prev, [t.id]: { running: false, startedAt: null, elapsed: 0 } })); persistProjElapsed(t._pid, t.id, 0); }} title="リセット" style={{ width: 40, height: 40, borderRadius: "50%", border: `2px solid ${T.border}`, background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, flexShrink: 0, color: T.textMuted }}>↺</button>
                     )}
                     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                      <button onClick={() => { setQuickDelegId(quickDelegId === t.id ? null : t.id); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} title="依頼転送（進行中に飛ばす）" style={{ background: quickDelegId === t.id ? T.accent + "22" : T.accent + "15", border: `1px solid ${T.accent}44`, color: T.accent, cursor: "pointer", fontSize: 9, padding: "2px 6px", borderRadius: 4, fontFamily: T.font, fontWeight: 600 }}>📤 依頼</button>
                       <button onClick={() => toggleProjTaskType(t._pid, t.id)} title="進行中に変更" style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.5 }}>🔄</button>
                       <button onClick={() => setEditingProjTask({ _pid: t._pid, id: t.id, text: t.text, estimateMin: Math.round(estSec / 60) })} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.5 }}>✏️</button>
                       <button onClick={() => deleteProjTask(t._pid, t.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
                     </div>
                   </div>
+                  {/* Quick delegate inline form */}
+                  {quickDelegId === t.id && (
+                    <div style={{ padding: "8px 12px", borderTop: `1px solid ${T.accent}44`, background: T.accent + "06" }}>
+                      <div style={{ fontSize: 10, fontWeight: 600, color: T.accent, marginBottom: 6 }}>📤 依頼転送（進行中で作成）</div>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                        <input value={quickDelegAssignee} onChange={(e) => setQuickDelegAssignee(e.target.value)} placeholder="依頼先" style={{ flex: 1, minWidth: 80, padding: "5px 8px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} autoFocus />
+                        <input value={quickDelegDeadline} onChange={(e) => setQuickDelegDeadline(e.target.value)} placeholder="期限 MM/DD" style={{ width: 80, padding: "5px 8px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} onKeyDown={(e) => { if (e.key === "Enter") submitQuickDeleg(t.id); }} />
+                        <Btn onClick={() => submitQuickDeleg(t.id)} style={{ fontSize: 10, padding: "4px 10px" }}>転送</Btn>
+                        <Btn variant="ghost" onClick={() => { setQuickDelegId(null); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} style={{ fontSize: 10, padding: "4px 8px" }}>✕</Btn>
+                      </div>
+                    </div>
+                  )}
                   {editingProjTask?.id === t.id && (
                     <div style={{ padding: "8px 12px", borderTop: `1px solid ${T.border}`, background: T.bg, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "flex-end" }}>
                       <input value={editingProjTask.text} onChange={(e) => setEditingProjTask({ ...editingProjTask, text: e.target.value })} style={{ flex: 1, minWidth: 120, padding: "5px 8px", background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, color: T.text, fontSize: 12, fontFamily: T.font }} />
