@@ -1300,7 +1300,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
 
                   {/* Actions */}
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <button onClick={() => { setQuickDelegId(quickDelegId === task.id ? null : task.id); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} title="依頼転送" style={{ background: "none", border: "none", color: quickDelegId === task.id ? T.accent : T.textDim, cursor: "pointer", fontSize: 10, opacity: quickDelegId === task.id ? 1 : 0.5 }}>📤</button>
+                    <button onClick={() => { setQuickDelegId(quickDelegId === task.id ? null : task.id); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} title="依頼転送（進行中に飛ばす）" style={{ background: quickDelegId === task.id ? T.accent + "22" : T.accent + "15", border: `1px solid ${T.accent}44`, color: T.accent, cursor: "pointer", fontSize: 9, padding: "2px 6px", borderRadius: 4, fontFamily: T.font, fontWeight: 600 }}>📤 依頼</button>
                     <button onClick={() => setEditingTask({ id: task.id, name: task.name, project: task.project, estimateMin: Math.round((task.estimateSec || 0) / 60), elapsedMin: Math.round(elapsed / 60) })} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.5 }}>✏️</button>
                     <button onClick={() => { setEditingMemo(task.id); setMemoText(task.memo || ""); }} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.5 }}>📝</button>
                     <button onClick={() => handleDeleteTask(task.id)} style={{ background: "none", border: "none", color: T.textDim, cursor: "pointer", fontSize: 10, opacity: 0.3 }}>🗑</button>
@@ -1475,7 +1475,7 @@ export default function TaskManagementView({ onNavigateToClient }) {
                             {task.project && <span style={{ fontSize: 9, color: T.textDim, marginLeft: 6 }}>[{truncate(task.project, 12)}]</span>}
                           </div>
                           <span style={{ fontSize: 14, fontWeight: 600, fontVariantNumeric: "tabular-nums", fontFamily: "'SF Mono', monospace", color: T.success }}>{fmtSec(elapsed)}</span>
-                          <button onClick={(e) => { e.stopPropagation(); setQuickDelegId(quickDelegId === task.id ? null : task.id); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} title="依頼転送" style={{ background: "none", border: "none", color: quickDelegId === task.id ? T.accent : T.textDim, cursor: "pointer", fontSize: 11, opacity: quickDelegId === task.id ? 1 : 0.5, padding: "2px 4px" }}>📤</button>
+                          <button onClick={(e) => { e.stopPropagation(); setQuickDelegId(quickDelegId === task.id ? null : task.id); setQuickDelegAssignee(""); setQuickDelegDeadline(""); }} title="依頼転送（進行中に飛ばす）" style={{ background: quickDelegId === task.id ? T.accent + "22" : T.accent + "15", border: `1px solid ${T.accent}44`, color: T.accent, cursor: "pointer", fontSize: 10, padding: "3px 8px", borderRadius: 4, fontFamily: T.font, fontWeight: 600, flexShrink: 0 }}>📤 依頼</button>
                           <span style={{ fontSize: 11, color: T.textDim }}>✏️</span>
                         </div>
                         {/* Quick delegate inline form */}
